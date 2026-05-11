@@ -21,8 +21,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title=settings.app_name)
-# Keep table creation at import-time so test paths without startup hooks can still run.
-Base.metadata.create_all(bind=engine)
 
 
 def verify_github_signature(payload_bytes: bytes, signature_header: str | None) -> bool:

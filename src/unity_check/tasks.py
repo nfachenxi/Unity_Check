@@ -1,10 +1,9 @@
-import json
 import logging
 
 from sqlalchemy import select
 
 from unity_check.celery_app import celery_app
-from unity_check.db import Base, SessionLocal, engine
+from unity_check.db import SessionLocal
 from unity_check.llm import evaluate_with_llm
 from unity_check.models import GithubEvent
 
@@ -30,8 +29,6 @@ def build_event_summary(event: GithubEvent) -> str:
 def process_github_event(event_id: int) -> dict[str, str]:
     db = SessionLocal()
     try:
-        # Worker may run before API startup hook in isolated test runs.
-        Base.metadata.create_all(bind=engine)
         event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
         if event is None:
             return {"status": "not_found", "message": f"event_id={event_id} not found"}
