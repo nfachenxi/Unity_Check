@@ -33,16 +33,15 @@ def process_github_event(event_id: int) -> dict[str, str]:
         if event is None:
             return {"status": "not_found", "message": f"event_id={event_id} not found"}
 
-        event.status = "running"
+        with db.begin_nested():
+            event.status = "running"
+            summary = build_event_summary(event)
+            llm_result = evaluate_with_llm(event.event_type, event.action, summary)
+            event.risk_level = llm_result.get("risk_level", "unknown")
+            event.evaluation_summary = llm_result.get("summary", summary)
+            event.status = "success"
         db.commit()
 
-        # Current stage uses one-pass model triage and persists normalized result fields.
-        summary = build_event_summary(event)
-        llm_result = evaluate_with_llm(event.event_type, event.action, summary)
-        event.risk_level = llm_result.get("risk_level", "unknown")
-        event.evaluation_summary = llm_result.get("summary", summary)
-        event.status = "success"
-        db.commit()
         return {
             "status": "success",
             "event_id": str(event_id),

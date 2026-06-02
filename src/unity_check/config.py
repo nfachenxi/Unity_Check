@@ -23,7 +23,9 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="deepseek-chat", alias="LLM_MODEL")
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
 
+    git_ssh_key_path: str = Field(default="", alias="GIT_SSH_KEY_PATH")
 
-@lru_cache
+
+@lru_cache()
 def get_settings() -> Settings:
     return Settings()

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"f:/work/Project\" rm --cached .env)",
+      "Bash(git -C \"f:/work/Project\" add .gitignore)",
+      "Bash(git -C f:/work/Project commit -m ' *)",
+      "Bash(git -C \"f:/work/Project\" add src/unity_check/main.py src/unity_check/tasks.py)"
+    ]
+  }
+}

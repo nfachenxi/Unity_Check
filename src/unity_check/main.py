@@ -2,8 +2,10 @@ import hashlib
 import hmac
 import json
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session
 
@@ -20,7 +22,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title=settings.app_name)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables are ready.")
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
 def verify_github_signature(payload_bytes: bytes, signature_header: str | None) -> bool:
@@ -38,12 +48,6 @@ def verify_github_signature(payload_bytes: bytes, signature_header: str | None) 
     return hmac.compare_digest(expected, provided)
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables are ready.")
-
-
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)) -> dict[str, str]:
     db.execute(text("SELECT 1"))
@@ -58,14 +62,19 @@ async def receive_github_webhook(
     x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    # Only handle the two event types included in phase-1 scope.
     event_type = x_github_event.strip()
-    if event_type not in {"push", "pull_request"}:
-        raise HTTPException(status_code=400, detail="Only push and pull_request are supported.")
-
     payload_bytes = await request.body()
+
     if not verify_github_signature(payload_bytes, x_hub_signature_256):
         raise HTTPException(status_code=401, detail="Invalid signature.")
+
+    if event_type == "ping":
+        logger.info("Ping event received (delivery=%s)", x_github_delivery)
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    # Only handle the two event types included in phase-1 scope.
+    if event_type not in {"push", "pull_request"}:
+        raise HTTPException(status_code=400, detail="Only push and pull_request are supported.")
 
     try:
         payload = json.loads(payload_bytes.decode("utf-8"))

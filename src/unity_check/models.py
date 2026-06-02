@@ -1,8 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import DateTime, JSON, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from unity_check.db import Base
@@ -16,7 +15,7 @@ class GithubEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     action: Mapped[str | None] = mapped_column(String(64), index=True)
     repository: Mapped[str | None] = mapped_column(String(255), index=True)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     task_id: Mapped[str | None] = mapped_column(String(64), index=True)
     risk_level: Mapped[str | None] = mapped_column(String(16))
