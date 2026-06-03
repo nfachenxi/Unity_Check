@@ -1,9 +1,13 @@
+"""Tests for webhook parsing and new GET /events/{event_id} endpoint."""
+
 import json
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
+from unity_check.db import get_db
 from unity_check.main import app
 from unity_check.models import GithubEvent
 
@@ -14,12 +18,13 @@ def _fake_task_id() -> str:
 
 @pytest.fixture(autouse=True)
 def _override_dependencies(monkeypatch, session):
-    """All FastAPI endpoints use the test session; Celery tasks are mocked."""
+    """Override FastAPI dependencies and Celery tasks for testing.
 
-    def override_get_db():
-        yield session
-
-    monkeypatch.setattr("unity_check.main.get_db", override_get_db)
+    Uses app.dependency_overrides (canonical FastAPI test approach)
+    rather than monkeypatch on Depends imports.
+    """
+    # FastAPI dependency override — canonical approach
+    app.dependency_overrides[get_db] = lambda: session
 
     # Mock process_github_event.delay so we never touch Celery/Redis
     class _FakeAsyncResult:
@@ -28,14 +33,15 @@ def _override_dependencies(monkeypatch, session):
             self.event_id = event_id
 
     def _fake_delay(event_id):
-        # Also simulate the task-side effect: set task_id and status inline
-        # so persistence tests don't need a real worker
         return _FakeAsyncResult(event_id)
 
     monkeypatch.setattr("unity_check.main.process_github_event.delay", _fake_delay)
-
-    # Patch SessionLocal used by tasks to avoid real DB connections
     monkeypatch.setattr("unity_check.tasks.SessionLocal", lambda: session)
+
+    yield
+
+    # Cleanup
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture()
@@ -61,7 +67,6 @@ class TestWebhookPing:
         assert resp.json() == {"status": "ok"}
 
     def test_ping_with_signature_header_still_ok(self, client):
-        """ping with a sha256 header passes when no secret is configured."""
         resp = client.post(
             "/webhook/github",
             headers={
@@ -74,7 +79,8 @@ class TestWebhookPing:
 
 
 class TestWebhookPush:
-    def _valid_push_payload(self):
+    @staticmethod
+    def _valid_push_payload():
         return {
             "ref": "refs/heads/main",
             "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -82,13 +88,16 @@ class TestWebhookPush:
             "repository": {"full_name": "test/repo"},
         }
 
-    def _valid_pr_payload(self):
+    @staticmethod
+    def _valid_pr_payload():
         return {
             "action": "opened",
             "number": 42,
             "pull_request": {
                 "number": 42,
                 "title": "Test PR",
+                "base": {"sha": "base-sha-40-chars-base-sha-40-charsss"},
+                "head": {"sha": "head-sha-40-chars-head-sha-40-charsss"},
             },
             "repository": {"full_name": "test/repo"},
         }
@@ -133,11 +142,39 @@ class TestWebhookPush:
         assert resp.status_code == 202
         data = resp.json()
         assert data["status"] == "accepted"
-        # Verify via API — if the event was committed to DB, /events/latest
-        # returns it.
         latest = client.get("/events/latest").json()
         ids = [e["id"] for e in latest]
         assert int(data["event_id"]) in ids
+
+    def test_sha_extracted_for_push(self, client, session):
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "delivery-push-sha",
+            },
+            content=json.dumps(self._valid_push_payload()).encode(),
+        )
+        assert resp.status_code == 202
+        event_id = resp.json()["event_id"]
+        detail = client.get(f"/events/{event_id}").json()
+        assert detail["after_sha"] == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        assert detail["before_sha"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def test_sha_extracted_for_pr(self, client, session):
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "delivery-pr-sha",
+            },
+            content=json.dumps(self._valid_pr_payload()).encode(),
+        )
+        assert resp.status_code == 202
+        event_id = resp.json()["event_id"]
+        detail = client.get(f"/events/{event_id}").json()
+        assert detail["before_sha"] == "base-sha-40-chars-base-sha-40-charsss"
+        assert detail["after_sha"] == "head-sha-40-chars-head-sha-40-charsss"
 
     def test_idempotent_by_delivery_id(self, client, session):
         headers = {
@@ -149,7 +186,6 @@ class TestWebhookPush:
         assert r1.status_code == 202
         session.flush()
         r2 = client.post("/webhook/github", headers=headers, content=body)
-        # Duplicate delivery returns 202 (decorator) but reuses existing event
         assert r2.status_code == 202
         assert r2.json()["event_id"] == r1.json()["event_id"]
 
@@ -190,7 +226,6 @@ class TestWebhookValidation:
 
 class TestEventsLatest:
     def test_empty_db_returns_list_not_error(self, client):
-        """When DB may have leftover rows, endpoint still returns a valid list."""
         resp = client.get("/events/latest")
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
@@ -220,6 +255,8 @@ class TestEventsLatest:
         assert "event_type" in item
         assert "status" in item
         assert "risk_level" in item
+        assert "after_sha" in item
+        assert "diff_size" in item
 
     def test_limit_capped_at_100(self, client, session):
         resp = client.get("/events/latest?limit=999")
@@ -228,3 +265,33 @@ class TestEventsLatest:
     def test_limit_floor_1(self, client, session):
         resp = client.get("/events/latest?limit=0")
         assert resp.status_code == 200
+
+
+class TestEventDetail:
+    def test_returns_full_event(self, client, session):
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "delivery-detail-001",
+            },
+            content=json.dumps({
+                "ref": "refs/heads/main",
+                "before": "a" * 40,
+                "after": "b" * 40,
+                "repository": {"full_name": "test/repo"},
+            }).encode(),
+        )
+        assert resp.status_code == 202
+        event_id = resp.json()["event_id"]
+        detail = client.get(f"/events/{event_id}").json()
+        assert detail["id"] == int(event_id)
+        assert detail["event_type"] == "push"
+        assert "diff_content" in detail
+        assert "clone_path" in detail
+        assert "evaluation_summary" in detail
+        assert "updated_at" in detail
+
+    def test_nonexistent_event_returns_404(self, client):
+        resp = client.get("/events/99999")
+        assert resp.status_code == 404

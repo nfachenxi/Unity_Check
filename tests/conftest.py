@@ -39,7 +39,7 @@ def session(engine):
 def _mock_llm(monkeypatch):
     """Prevent any real LLM API call in the test suite."""
 
-    def fake_evaluate(event_type, action, summary):
+    def fake_evaluate(event_type, action, summary, diff_content=""):
         return {"risk_level": "low", "summary": "mocked summary"}
 
     monkeypatch.setattr("unity_check.llm.evaluate_with_llm", fake_evaluate)

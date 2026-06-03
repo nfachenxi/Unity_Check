@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db
+from unity_check.git_service import extract_sha_from_payload
 from unity_check.models import GithubEvent
 from unity_check.tasks import process_github_event
 
@@ -91,11 +92,16 @@ async def receive_github_webhook(
     repository = ((payload.get("repository") or {}).get("full_name")) if isinstance(payload, dict) else None
     action = payload.get("action") if isinstance(payload, dict) else None
 
+    # Extract before/after SHA from payload for git diff operations.
+    before_sha, after_sha = extract_sha_from_payload(payload, event_type)
+
     event = GithubEvent(
         delivery_id=x_github_delivery,
         event_type=event_type,
         action=action,
         repository=repository,
+        before_sha=before_sha,
+        after_sha=after_sha,
         payload=payload,
         status="queued",
     )
@@ -121,10 +127,39 @@ def get_latest_events(limit: int = 20, db: Session = Depends(get_db)) -> list[di
             "event_type": item.event_type,
             "action": item.action,
             "repository": item.repository,
+            "after_sha": item.after_sha,
+            "before_sha": item.before_sha,
             "status": item.status,
             "risk_level": item.risk_level,
             "task_id": item.task_id,
+            "diff_size": item.diff_size,
             "created_at": item.created_at.isoformat() if item.created_at else None,
         }
         for item in records
     ]
+
+
+@app.get("/events/{event_id}")
+def get_event_detail(event_id: int, db: Session = Depends(get_db)) -> dict[str, str | int | None]:
+    event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+    return {
+        "id": event.id,
+        "delivery_id": event.delivery_id,
+        "event_type": event.event_type,
+        "action": event.action,
+        "repository": event.repository,
+        "after_sha": event.after_sha,
+        "before_sha": event.before_sha,
+        "clone_path": event.clone_path,
+        "diff_content": event.diff_content,
+        "diff_size": event.diff_size,
+        "status": event.status,
+        "risk_level": event.risk_level,
+        "evaluation_summary": event.evaluation_summary,
+        "error_message": event.error_message,
+        "task_id": event.task_id,
+        "created_at": event.created_at.isoformat() if event.created_at else None,
+        "updated_at": event.updated_at.isoformat() if event.updated_at else None,
+    }
