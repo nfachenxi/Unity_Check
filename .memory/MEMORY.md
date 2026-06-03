@@ -1,3 +1,0 @@
-- [第一阶段已知 Bug 与功能缺口](phase1-bugs-and-gaps.md) — 4 个已知 bug + 若干功能缺口
-- [架构风险](architecture-risks.md) — 单表混存、Roslyn 集成、多轮评估数据流未定义
-- [开发计划进展状态](dev-plan-status.md) — Phase 1 完成度与后续阶段概览
