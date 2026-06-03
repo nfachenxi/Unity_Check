@@ -64,6 +64,40 @@ class TestSettingsLoading:
         settings = Settings(_env_file=None)
         assert settings.git_ssh_key_path == "/home/user/.ssh/id_rsa"
 
+    def test_roslyn_service_url_defaults(self, monkeypatch):
+        """ROSLYN_SERVICE_URL should default to http://roslyn:5000."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+        monkeypatch.setenv("REDIS_URL", "redis://test")
+        monkeypatch.setenv("GITHUB_REMOTE_REPO", "git@test")
+        settings = Settings(_env_file=None)
+        assert settings.roslyn_service_url == "http://roslyn:5000"
+
+    def test_roslyn_service_url_from_env(self, monkeypatch):
+        """ROSLYN_SERVICE_URL should be read from env."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+        monkeypatch.setenv("REDIS_URL", "redis://test")
+        monkeypatch.setenv("GITHUB_REMOTE_REPO", "git@test")
+        monkeypatch.setenv("ROSLYN_SERVICE_URL", "http://custom:9000")
+        settings = Settings(_env_file=None)
+        assert settings.roslyn_service_url == "http://custom:9000"
+
+    def test_default_analyze_paths_defaults(self, monkeypatch):
+        """DEFAULT_ANALYZE_PATHS should default to Assets/Scripts."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+        monkeypatch.setenv("REDIS_URL", "redis://test")
+        monkeypatch.setenv("GITHUB_REMOTE_REPO", "git@test")
+        settings = Settings(_env_file=None)
+        assert settings.default_analyze_paths == "Assets/Scripts"
+
+    def test_default_analyze_paths_from_env(self, monkeypatch):
+        """DEFAULT_ANALYZE_PATHS should be read from env."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+        monkeypatch.setenv("REDIS_URL", "redis://test")
+        monkeypatch.setenv("GITHUB_REMOTE_REPO", "git@test")
+        monkeypatch.setenv("DEFAULT_ANALYZE_PATHS", "Path/A,Path/B")
+        settings = Settings(_env_file=None)
+        assert settings.default_analyze_paths == "Path/A,Path/B"
+
 
 class TestGetSettingsCache:
     """Verify @lru_cache() works on get_settings()."""

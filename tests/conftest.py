@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from unity_check.db import Base
-from unity_check.models import GithubEvent  # noqa: F401 — register ORM table
+from unity_check.models import GithubEvent, RepoScanConfig, RuleResult  # noqa: F401 — register ORM table
 
 
 @pytest.fixture(scope="session")
@@ -44,3 +44,33 @@ def _mock_llm(monkeypatch):
 
     monkeypatch.setattr("unity_check.llm.evaluate_with_llm", fake_evaluate)
     monkeypatch.setattr("unity_check.tasks.evaluate_with_llm", fake_evaluate)
+
+
+@pytest.fixture(autouse=True)
+def _mock_roslyn(monkeypatch):
+    """Prevent any real Roslyn HTTP calls in the test suite.
+
+    Also patches task-local imports so process_github_event and
+    run_baseline_scan_task never make real HTTP requests.
+    """
+
+    def fake_run_roslyn_analysis(files):
+        return []
+
+    def fake_extract_cs_files(diff_content):
+        return []
+
+    def fake_filter_targets(file_paths, analyze_paths):
+        return []
+
+    def fake_ensure_baseline(event, db):
+        return None
+
+    def fake_run_roslyn_incremental(event, db):
+        return 0
+
+    monkeypatch.setattr("unity_check.tasks.run_roslyn_analysis", fake_run_roslyn_analysis)
+    monkeypatch.setattr("unity_check.tasks.extract_cs_files_from_diff", fake_extract_cs_files)
+    monkeypatch.setattr("unity_check.tasks.filter_analyze_targets", fake_filter_targets)
+    monkeypatch.setattr("unity_check.tasks._ensure_baseline_scan", fake_ensure_baseline)
+    monkeypatch.setattr("unity_check.tasks._run_roslyn_incremental", fake_run_roslyn_incremental)

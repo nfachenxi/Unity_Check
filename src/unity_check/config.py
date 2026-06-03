@@ -25,6 +25,9 @@ class Settings(BaseSettings):
 
     git_ssh_key_path: str = Field(default="", alias="GIT_SSH_KEY_PATH")
 
+    roslyn_service_url: str = Field(default="http://roslyn:5000", alias="ROSLYN_SERVICE_URL")
+    default_analyze_paths: str = Field(default="Assets/Scripts", alias="DEFAULT_ANALYZE_PATHS")
+
 
 @lru_cache()
 def get_settings() -> Settings:

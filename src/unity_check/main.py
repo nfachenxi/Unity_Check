@@ -12,8 +12,13 @@ from sqlalchemy.orm import Session
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db
 from unity_check.git_service import extract_sha_from_payload
-from unity_check.models import GithubEvent
-from unity_check.tasks import process_github_event
+from unity_check.models import GithubEvent, RepoScanConfig, RuleResult
+from unity_check.rule_service import (
+    ensure_repo_scan_config,
+    get_analyze_paths,
+    is_baseline_needed,
+)
+from unity_check.tasks import process_github_event, run_baseline_scan_task
 
 settings = get_settings()
 
@@ -162,4 +167,239 @@ def get_event_detail(event_id: int, db: Session = Depends(get_db)) -> dict[str, 
         "task_id": event.task_id,
         "created_at": event.created_at.isoformat() if event.created_at else None,
         "updated_at": event.updated_at.isoformat() if event.updated_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rule results
+# ---------------------------------------------------------------------------
+
+
+@app.get("/events/{event_id}/rules")
+def get_event_rules(
+    event_id: int,
+    severity: str | None = None,
+    category: str | None = None,
+    rule_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> list[dict[str, str | int | None]]:
+    """Return rule violations for an event, with optional filters."""
+    event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+
+    stmt = select(RuleResult).where(RuleResult.event_id == event_id)
+    if severity:
+        stmt = stmt.where(RuleResult.severity == severity.capitalize())
+    if category:
+        stmt = stmt.where(RuleResult.category == category)
+    if rule_id:
+        stmt = stmt.where(RuleResult.rule_id == rule_id)
+    stmt = (
+        stmt
+        .order_by(RuleResult.severity.desc(), RuleResult.file_path, RuleResult.line_number)
+        .limit(min(limit, 500))
+        .offset(max(0, offset))
+    )
+
+    rows = db.scalars(stmt).all()
+    return [
+        {
+            "id": r.id,
+            "rule_id": r.rule_id,
+            "rule_name": r.rule_name,
+            "file_path": r.file_path,
+            "line_number": r.line_number,
+            "column_number": r.column_number,
+            "severity": r.severity,
+            "category": r.category,
+            "message": r.message,
+            "snippet": r.snippet,
+            "scan_type": r.scan_type,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/rules/stats")
+def get_rules_stats(
+    repository: str | None = None,
+    days: int = 30,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Aggregated rule statistics: top rules, severity breakdown, trend."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+
+    # Base query
+    stmt = select(RuleResult)
+    if repository:
+        stmt = stmt.join(GithubEvent).where(
+            GithubEvent.repository == repository,
+            RuleResult.created_at >= since,
+        )
+    else:
+        stmt = stmt.where(RuleResult.created_at >= since)
+
+    rows = db.scalars(stmt).all()
+
+    # Severity breakdown
+    severity_counts: dict[str, int] = {}
+    # Top rules
+    rule_counts: dict[str, int] = {}
+    # Top files
+    file_counts: dict[str, int] = {}
+
+    for r in rows:
+        sev = r.severity.lower()
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+        key = f"{r.rule_id}: {r.rule_name}"
+        rule_counts[key] = rule_counts.get(key, 0) + 1
+        file_counts[r.file_path] = file_counts.get(r.file_path, 0) + 1
+
+    top_rules = sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    top_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return {
+        "total": len(rows),
+        "severity_breakdown": severity_counts,
+        "top_rules": [{"rule": k, "count": v} for k, v in top_rules],
+        "top_files": [{"file": k, "count": v} for k, v in top_files],
+        "since_days": days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Repository scan configuration
+# ---------------------------------------------------------------------------
+
+def _repo_name_from_path(repo: str) -> str:
+    """Normalise a URL-encoded or raw repository name for lookup."""
+    return repo.strip().lower()
+
+
+@app.get("/repos/{repo_name}/config")
+def get_repo_config(
+    repo_name: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return scan configuration for a repository."""
+    name = _repo_name_from_path(repo_name)
+    config = db.scalar(
+        select(RepoScanConfig).where(RepoScanConfig.repository == name)
+    )
+    if config is None:
+        # Return default config without creating it.
+        return {
+            "repository": name,
+            "analyze_paths": get_analyze_paths(name, db),
+            "is_baseline_scanned": False,
+            "baseline_scan_status": None,
+            "baseline_total_files": None,
+            "baseline_total_issues": None,
+        }
+    return {
+        "repository": config.repository,
+        "analyze_paths": config.analyze_paths,
+        "is_baseline_scanned": config.is_baseline_scanned,
+        "baseline_scan_status": config.baseline_scan_status,
+        "baseline_total_files": config.baseline_total_files,
+        "baseline_total_issues": config.baseline_total_issues,
+    }
+
+
+@app.put("/repos/{repo_name}/config")
+def update_repo_config(
+    repo_name: str,
+    body: dict,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Create or update scan configuration for a repository.
+
+    Request body (all fields optional):
+    {
+        "repository": "owner/repo",
+        "analyze_paths": ["Assets/Scripts", "Assets/Editor"],
+        "is_baseline_scanned": false
+    }
+    """
+    name = _repo_name_from_path(repo_name)
+    config = ensure_repo_scan_config(name, db)
+
+    if "repository" in body and body["repository"]:
+        config.repository = str(body["repository"])
+    if "analyze_paths" in body and isinstance(body["analyze_paths"], list):
+        config.analyze_paths = [str(p) for p in body["analyze_paths"]]
+    if "is_baseline_scanned" in body:
+        config.is_baseline_scanned = bool(body["is_baseline_scanned"])
+
+    db.flush()
+    return {
+        "repository": config.repository,
+        "analyze_paths": config.analyze_paths,
+        "is_baseline_scanned": config.is_baseline_scanned,
+        "baseline_scan_status": config.baseline_scan_status,
+        "message": "Configuration updated.",
+    }
+
+
+@app.post("/repos/{repo_name}/baseline-scan")
+def trigger_baseline_scan(
+    repo_name: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Manually trigger a baseline scan for a repository.
+
+    Returns immediately with a Celery task_id; the scan runs async.
+    """
+    name = _repo_name_from_path(repo_name)
+    config = ensure_repo_scan_config(name, db)
+
+    if config.baseline_scan_status == "running":
+        return {
+            "status": "conflict",
+            "message": "A baseline scan is already running for this repository.",
+        }
+
+    # We need the repo's local path.  Since this is a manual trigger, use the
+    # configured GIT_CLONE_BASE_DIR + repo name to locate it.
+    import os
+    from unity_check.git_service import _repo_name_from_url as git_repo_name
+
+    clone_base = os.path.abspath(
+        os.environ.get("GIT_CLONE_BASE_DIR", "./repos")
+    )
+    # Try to find existing clone path; for manual trigger we try SSH format.
+    bare_candidate = os.path.join(
+        clone_base, f"{git_repo_name(f'git@github.com:{name}.git')}.git"
+    )
+    if not os.path.isdir(bare_candidate):
+        # Try https format
+        bare_candidate = os.path.join(
+            clone_base, f"{git_repo_name(f'https://github.com/{name}.git')}.git"
+        )
+
+    if not os.path.isdir(bare_candidate):
+        raise HTTPException(
+            status_code=400,
+            detail="Repository has not been cloned yet. "
+                    "Trigger a webhook first to initialise the bare clone.",
+        )
+
+    config.baseline_scan_status = "pending"
+    db.flush()
+
+    task = run_baseline_scan_task.delay(name, bare_candidate)
+    config.baseline_scan_status = "running"
+    db.flush()
+
+    return {
+        "status": "accepted",
+        "repository": name,
+        "task_id": task.id,
+        "message": "Baseline scan dispatched.",
     }

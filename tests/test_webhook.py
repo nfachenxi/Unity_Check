@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from unity_check.db import get_db
 from unity_check.main import app
-from unity_check.models import GithubEvent
+from unity_check.models import GithubEvent, RuleResult
 
 
 def _fake_task_id() -> str:
@@ -295,3 +295,228 @@ class TestEventDetail:
     def test_nonexistent_event_returns_404(self, client):
         resp = client.get("/events/99999")
         assert resp.status_code == 404
+
+
+class TestEventRules:
+    def test_empty_rules_for_event(self, client, session):
+        """An event without rule_results should return an empty list."""
+        event = GithubEvent(
+            delivery_id="rules-empty-web",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+        session.expunge(event)
+
+        resp = client.get(f"/events/{event_id}/rules")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_returns_rules_for_event(self, client, session):
+        """Rules persisted for an event should be returned."""
+        event = GithubEvent(
+            delivery_id="rules-web",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+        rules = [
+            RuleResult(
+                event_id=event_id,
+                rule_id="CA1822",
+                rule_name="Member can be static",
+                file_path="Assets/A.cs",
+                line_number=10,
+                severity="Warning",
+                category="Performance",
+                message="msg",
+                scan_type="incremental",
+            ),
+            RuleResult(
+                event_id=event_id,
+                rule_id="SA1300",
+                rule_name="Upper case",
+                file_path="Assets/B.cs",
+                line_number=1,
+                severity="Error",
+                category="Naming",
+                message="naming issue",
+                scan_type="incremental",
+            ),
+        ]
+        session.add_all(rules)
+        session.commit()
+
+        resp = client.get(f"/events/{event_id}/rules")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+
+    def test_filter_by_severity(self, client, session):
+        """Should only return rules matching the severity filter."""
+        event = GithubEvent(
+            delivery_id="rules-filter-sev",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+        session.add(RuleResult(
+            event_id=event_id, rule_id="R1", rule_name="n",
+            file_path="A.cs", severity="Warning", category="C1",
+            message="m", scan_type="incremental",
+        ))
+        session.add(RuleResult(
+            event_id=event_id, rule_id="R2", rule_name="n",
+            file_path="B.cs", severity="Error", category="C2",
+            message="m", scan_type="incremental",
+        ))
+        session.commit()
+
+        resp = client.get(f"/events/{event_id}/rules?severity=Error")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["severity"] == "Error"
+
+    def test_filter_by_rule_id(self, client, session):
+        """Should only return rules matching the rule_id filter."""
+        event = GithubEvent(
+            delivery_id="rules-filter-rid",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+        session.add(RuleResult(
+            event_id=event_id, rule_id="CA1822", rule_name="n",
+            file_path="A.cs", severity="Warning", category="C1",
+            message="m", scan_type="incremental",
+        ))
+        session.add(RuleResult(
+            event_id=event_id, rule_id="RCS1005", rule_name="n",
+            file_path="B.cs", severity="Warning", category="C2",
+            message="m", scan_type="incremental",
+        ))
+        session.commit()
+
+        resp = client.get(f"/events/{event_id}/rules?rule_id=CA1822")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["rule_id"] == "CA1822"
+
+    def test_nonexistent_event_404(self, client):
+        resp = client.get("/events/99999/rules")
+        assert resp.status_code == 404
+
+
+class TestRulesStats:
+    def test_empty_stats(self, client):
+        resp = client.get("/rules/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 0
+        assert "severity_breakdown" in data
+        assert "top_rules" in data
+
+    def test_stats_with_data(self, client, session):
+        event = GithubEvent(
+            delivery_id="stats-event",
+            event_type="push",
+            payload={},
+            status="success",
+            repository="test/stats-repo",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+        session.add_all([
+            RuleResult(
+                event_id=event_id, rule_id="R1", rule_name="Rule 1",
+                file_path="A.cs", severity="Warning", category="Perf",
+                message="m", scan_type="incremental",
+            ),
+            RuleResult(
+                event_id=event_id, rule_id="R1", rule_name="Rule 1",
+                file_path="B.cs", severity="Warning", category="Perf",
+                message="m", scan_type="incremental",
+            ),
+            RuleResult(
+                event_id=event_id, rule_id="R2", rule_name="Rule 2",
+                file_path="A.cs", severity="Error", category="Naming",
+                message="m", scan_type="incremental",
+            ),
+        ])
+        session.commit()
+
+        resp = client.get("/rules/stats?days=365")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 3
+        assert data["severity_breakdown"] == {"warning": 2, "error": 1}
+        assert len(data["top_rules"]) == 2
+        assert len(data["top_files"]) > 0
+
+
+class TestRepoConfig:
+    def test_get_default_config(self, client, monkeypatch):
+        from unity_check.config import get_settings
+
+        monkeypatch.setattr(
+            get_settings(), "default_analyze_paths", "Default/Path"
+        )
+        resp = client.get("/repos/test-default/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["repository"] == "test-default"
+        assert data["analyze_paths"] == ["Default/Path"]
+        assert data["is_baseline_scanned"] is False
+
+    def test_put_and_get_config(self, client, session):
+        resp = client.put(
+            "/repos/test-put/config",
+            json={
+                "repository": "test-put",
+                "analyze_paths": ["Custom/Scripts", "Custom/Editor"],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "Custom/Scripts" in data["analyze_paths"]
+        assert "Custom/Editor" in data["analyze_paths"]
+
+        # GET should return updated
+        resp2 = client.get("/repos/test-put/config")
+        assert resp2.status_code == 200
+        assert "Custom/Scripts" in resp2.json()["analyze_paths"]
+
+    def test_put_updates_existing(self, client, session):
+        # First PUT creates
+        client.put(
+            "/repos/test-update/config",
+            json={"analyze_paths": ["Path1"]},
+        )
+        # Second PUT updates
+        resp = client.put(
+            "/repos/test-update/config",
+            json={"analyze_paths": ["Path2"], "is_baseline_scanned": True},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["analyze_paths"] == ["Path2"]
+        assert data["is_baseline_scanned"] is True
