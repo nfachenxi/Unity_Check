@@ -7,7 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from unity_check.db import Base
 
 if TYPE_CHECKING:
-    from unity_check.models import EvaluationRound, RuleResult
+    from unity_check.models import EvaluationRound, RuleResult, Notification
 
 
 class GithubEvent(Base):
@@ -45,6 +45,9 @@ class GithubEvent(Base):
         back_populates="event", cascade="all, delete-orphan"
     )
     evaluation_rounds: Mapped[list["EvaluationRound"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan"
+    )
+    notifications: Mapped[list["Notification"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
 
@@ -116,6 +119,40 @@ class EvaluationRound(Base):
 
     # relationships
     event: Mapped["GithubEvent"] = relationship(back_populates="evaluation_rounds")
+
+
+class Notification(Base):
+    """Outbound notification record for a completed evaluation.
+
+    The message content is built and persisted here.  Actual delivery to
+    external channels (WeCom / Feishu) is delegated to an independent
+    tool platform via the reserved ``POST /api/notifications/{id}/send-status``
+    callback.
+    """
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("idx_notifications_event", "event_id"),
+        Index("idx_notifications_status", "status"),
+        Index("idx_notifications_channel", "channel"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("github_events.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    channel: Mapped[str] = mapped_column(String(32), default="wecom")  # wecom / feishu
+    trigger_reason: Mapped[str] = mapped_column(String(64))  # "critical", "high", "medium_low_score"
+    risk_level: Mapped[str | None] = mapped_column(String(16))
+    message_content: Mapped[str | None] = mapped_column(Text)  # rendered markdown / card JSON
+    webhook_url: Mapped[str | None] = mapped_column(String(1024))
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/sent/failed
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # relationships
+    event: Mapped["GithubEvent"] = relationship(back_populates="notifications")
 
 
 class RepoScanConfig(Base):

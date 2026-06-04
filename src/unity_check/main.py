@@ -6,13 +6,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import desc, select, text
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
 
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db
 from unity_check.git_service import extract_sha_from_payload
-from unity_check.models import EvaluationRound, GithubEvent, RepoScanConfig, RuleResult
+from unity_check.models import EvaluationRound, GithubEvent, Notification, RepoScanConfig, RuleResult
 from unity_check.rule_service import (
     ensure_repo_scan_config,
     get_analyze_paths,
@@ -142,6 +142,86 @@ def get_latest_events(limit: int = 20, db: Session = Depends(get_db)) -> list[di
         }
         for item in records
     ]
+
+
+@app.get("/api/events")
+def get_events_paginated(
+    page: int = 1,
+    page_size: int = 20,
+    event_type: str | None = None,
+    risk_level: str | None = None,
+    status: str | None = None,
+    repository: str | None = None,
+    sort: str = "desc",
+    db: Session = Depends(get_db),
+) -> dict:
+    """Paginated event list with optional filters.
+
+    Query params:
+        page: 1-based page number (default 1).
+        page_size: items per page (default 20, max 100).
+        event_type: filter by push / pull_request.
+        risk_level: filter by final_risk_level (low/medium/high/critical).
+        status: filter by event status (queued/running/success/failed).
+        repository: filter by repository name (exact match).
+        sort: created_at order — "desc" (default) or "asc".
+    """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+
+    base = select(GithubEvent)
+    count_base = select(func.count(GithubEvent.id))
+
+    if event_type:
+        base = base.where(GithubEvent.event_type == event_type)
+        count_base = count_base.where(GithubEvent.event_type == event_type)
+    if risk_level:
+        base = base.where(GithubEvent.final_risk_level == risk_level)
+        count_base = count_base.where(GithubEvent.final_risk_level == risk_level)
+    if status:
+        base = base.where(GithubEvent.status == status)
+        count_base = count_base.where(GithubEvent.status == status)
+    if repository:
+        base = base.where(GithubEvent.repository == repository)
+        count_base = count_base.where(GithubEvent.repository == repository)
+
+    total = db.scalar(count_base) or 0
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    order = GithubEvent.created_at.desc() if sort == "desc" else GithubEvent.created_at.asc()
+    rows = db.scalars(
+        base.order_by(order).limit(page_size).offset(offset)
+    ).all()
+
+    items = [
+        {
+            "id": item.id,
+            "delivery_id": item.delivery_id,
+            "event_type": item.event_type,
+            "action": item.action,
+            "repository": item.repository,
+            "after_sha": item.after_sha,
+            "diff_size": item.diff_size,
+            "status": item.status,
+            "overall_score": item.overall_score,
+            "final_risk_level": item.final_risk_level,
+            "recommendation": item.recommendation,
+            "executive_summary": item.executive_summary,
+            "task_id": item.task_id,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+            "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        }
+        for item in rows
+    ]
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
 
 
 @app.get("/events/{event_id}")
@@ -512,3 +592,348 @@ def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
         "task_id": task.id,
         "message": "Re-evaluation triggered.",
     }
+
+
+# ---------------------------------------------------------------------------
+# P4: Notification endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/notifications")
+def get_notifications(
+    event_id: int | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Return notifications, optionally filtered by event_id or status."""
+    from sqlalchemy import select as sa_select
+
+    stmt = sa_select(Notification)
+    if event_id is not None:
+        stmt = stmt.where(Notification.event_id == event_id)
+    if status:
+        stmt = stmt.where(Notification.status == status)
+    stmt = (
+        stmt
+        .order_by(Notification.created_at.desc())
+        .limit(min(limit, 200))
+        .offset(max(0, offset))
+    )
+
+    rows = db.scalars(stmt).all()
+    return [
+        {
+            "id": n.id,
+            "event_id": n.event_id,
+            "channel": n.channel,
+            "trigger_reason": n.trigger_reason,
+            "risk_level": n.risk_level,
+            "message_content": n.message_content,
+            "webhook_url": n.webhook_url,
+            "status": n.status,
+            "sent_at": n.sent_at.isoformat() if n.sent_at else None,
+            "error_message": n.error_message,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        }
+        for n in rows
+    ]
+
+
+@app.post("/api/notifications/{notification_id}/send-status")
+def update_notification_send_status(
+    notification_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Callback endpoint for the external tool platform to update delivery status.
+
+    Request body:
+    {
+        "status": "sent" | "failed",
+        "error_message": "optional error detail"
+    }
+    """
+    from unity_check.notification_service import update_notification_status
+
+    new_status = str(body.get("status", "pending"))
+    if new_status not in ("sent", "failed", "pending"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{new_status}'. Must be sent, failed, or pending.",
+        )
+
+    error_msg = body.get("error_message")
+    notif = update_notification_status(
+        notification_id, new_status, db, error_message=str(error_msg) if error_msg else None
+    )
+    if notif is None:
+        raise HTTPException(status_code=404, detail=f"Notification {notification_id} not found")
+
+    return {
+        "id": notif.id,
+        "status": notif.status,
+        "sent_at": notif.sent_at.isoformat() if notif.sent_at else None,
+        "message": "Status updated.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# P4: Dashboard / stats API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/dashboard/summary")
+def dashboard_summary(
+    days: int = 30,
+    repository: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Aggregated dashboard summary: event counts, risk distribution, score stats."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+
+    # Base query
+    base = select(GithubEvent).where(GithubEvent.created_at >= since)
+    if repository:
+        base = base.where(GithubEvent.repository == repository)
+
+    events = db.scalars(base.order_by(GithubEvent.created_at.desc())).all()
+
+    total = len(events)
+    risk_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    scores: list[float] = []
+
+    for e in events:
+        # Risk distribution
+        risk = (e.final_risk_level or "unknown").lower()
+        risk_counts[risk] = risk_counts.get(risk, 0) + 1
+        # Event type
+        t = e.event_type or "unknown"
+        type_counts[t] = type_counts.get(t, 0) + 1
+        # Scores
+        if e.overall_score is not None:
+            scores.append(e.overall_score)
+
+    avg_score = round(sum(scores) / len(scores), 1) if scores else None
+
+    # Recent events (last 10)
+    recent = [
+        {
+            "id": e.id,
+            "event_type": e.event_type,
+            "repository": e.repository,
+            "status": e.status,
+            "overall_score": e.overall_score,
+            "final_risk_level": e.final_risk_level,
+            "recommendation": e.recommendation,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in events[:10]
+    ]
+
+    # Status breakdown
+    status_counts: dict[str, int] = {}
+    for e in events:
+        s = e.status or "unknown"
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    return {
+        "total_events": total,
+        "risk_distribution": risk_counts,
+        "event_type_distribution": type_counts,
+        "status_distribution": status_counts,
+        "average_score": avg_score,
+        "recent_events": recent,
+        "since_days": days,
+    }
+
+
+@app.get("/api/dashboard/trends")
+def dashboard_trends(
+    days: int = 30,
+    repository: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Daily trend data: score & event count per day."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+
+    base = select(GithubEvent).where(GithubEvent.created_at >= since)
+    if repository:
+        base = base.where(GithubEvent.repository == repository)
+
+    events = db.scalars(base.order_by(GithubEvent.created_at)).all()
+
+    # Group by date
+    daily: dict[str, dict[str, int | float | list]] = {}
+    for e in events:
+        day = e.created_at.strftime("%Y-%m-%d") if e.created_at else "unknown"
+        if day not in daily:
+            daily[day] = {"date": day, "count": 0, "scores": []}
+        daily[day]["count"] += 1
+        if e.overall_score is not None:
+            daily[day]["scores"].append(e.overall_score)
+
+    result = []
+    for day, data in sorted(daily.items()):
+        scores_list = data["scores"]
+        result.append({
+            "date": day,
+            "event_count": data["count"],
+            "avg_score": round(sum(scores_list) / len(scores_list), 1) if scores_list else None,
+        })
+
+    return result
+
+
+@app.get("/api/dashboard/issue-distribution")
+def dashboard_issue_distribution(
+    days: int = 30,
+    repository: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Rule and semantic finding distribution: by category, severity, source."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+
+    # Rule results
+    rule_base = (
+        select(RuleResult)
+        .join(GithubEvent)
+        .where(GithubEvent.created_at >= since)
+    )
+    if repository:
+        rule_base = rule_base.where(GithubEvent.repository == repository)
+    rules = db.scalars(rule_base).all()
+
+    # Category breakdown
+    rule_category_counts: dict[str, int] = {}
+    rule_severity_counts: dict[str, int] = {}
+    for r in rules:
+        cat = (r.category or "uncategorized").lower()
+        rule_category_counts[cat] = rule_category_counts.get(cat, 0) + 1
+        sev = r.severity.lower()
+        rule_severity_counts[sev] = rule_severity_counts.get(sev, 0) + 1
+
+    # Semantic findings from evaluation_rounds (R2 output)
+    eval_base = (
+        select(EvaluationRound)
+        .join(GithubEvent)
+        .where(
+            GithubEvent.created_at >= since,
+            EvaluationRound.round_number == 2,
+            EvaluationRound.status == "success",
+        )
+    )
+    if repository:
+        eval_base = eval_base.where(GithubEvent.repository == repository)
+    eval_rounds = db.scalars(eval_base).all()
+
+    semantic_category_counts: dict[str, int] = {}
+    semantic_severity_counts: dict[str, int] = {}
+    for er in eval_rounds:
+        findings = (er.output_data or {}).get("findings", []) or []
+        for f in findings:
+            cat = (f.get("category", "unknown") or "unknown").lower()
+            semantic_category_counts[cat] = semantic_category_counts.get(cat, 0) + 1
+            sev = (f.get("severity", "unknown") or "unknown").lower()
+            semantic_severity_counts[sev] = semantic_severity_counts.get(sev, 0) + 1
+
+    return {
+        "rules": {
+            "total": len(rules),
+            "by_category": rule_category_counts,
+            "by_severity": rule_severity_counts,
+        },
+        "semantic": {
+            "total": sum(semantic_category_counts.values()),
+            "by_category": semantic_category_counts,
+            "by_severity": semantic_severity_counts,
+        },
+        "since_days": days,
+    }
+
+
+@app.get("/api/stats/scores")
+def stats_scores(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    repository: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Score statistics over a date range.
+
+    Query params: from_date / to_date in ISO format (e.g. 2026-05-01).
+    """
+    from datetime import datetime, timezone
+
+    base = select(
+        GithubEvent.overall_score,
+        GithubEvent.final_risk_level,
+        GithubEvent.created_at,
+    )
+    if from_date:
+        try:
+            f = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
+            base = base.where(GithubEvent.created_at >= f)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid from_date format")
+    if to_date:
+        try:
+            t = datetime.fromisoformat(to_date).replace(tzinfo=timezone.utc)
+            base = base.where(GithubEvent.created_at <= t)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid to_date format")
+    if repository:
+        base = base.where(GithubEvent.repository == repository)
+    base = base.where(GithubEvent.overall_score.isnot(None)).order_by(GithubEvent.created_at)
+
+    rows = db.execute(base).all()
+    scores = [r[0] for r in rows if r[0] is not None]
+
+    if not scores:
+        return {"count": 0, "min": None, "max": None, "avg": None, "scores": []}
+
+    return {
+        "count": len(scores),
+        "min": round(min(scores), 1),
+        "max": round(max(scores), 1),
+        "avg": round(sum(scores) / len(scores), 1),
+        "scores": [round(s, 1) for s in scores],
+    }
+
+
+@app.get("/api/stats/hotspots")
+def stats_hotspots(
+    limit: int = 10,
+    days: int = 30,
+    repository: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Top files by rule-result count (hotspots)."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+
+    base = (
+        select(RuleResult.file_path, func.count().label("cnt"))
+        .join(GithubEvent)
+        .where(GithubEvent.created_at >= since)
+    )
+    if repository:
+        base = base.where(GithubEvent.repository == repository)
+    base = (
+        base
+        .group_by(RuleResult.file_path)
+        .order_by(func.count().desc())
+        .limit(min(limit, 50))
+    )
+
+    rows = db.execute(base).all()
+    return [{"file": r[0], "count": r[1]} for r in rows]

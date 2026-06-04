@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from unity_check.db import Base
-from unity_check.models import EvaluationRound, GithubEvent, RepoScanConfig, RuleResult  # noqa: F401 — register ORM tables
+from unity_check.models import EvaluationRound, GithubEvent, Notification, RepoScanConfig, RuleResult  # noqa: F401 — register ORM tables
 
 
 @pytest.fixture(scope="session")
@@ -111,3 +111,16 @@ def _mock_roslyn(monkeypatch):
     monkeypatch.setattr("unity_check.tasks.filter_analyze_targets", fake_filter_targets)
     monkeypatch.setattr("unity_check.tasks._ensure_baseline_scan", fake_ensure_baseline)
     monkeypatch.setattr("unity_check.tasks._run_roslyn_incremental", fake_run_roslyn_incremental)
+
+
+@pytest.fixture(autouse=True)
+def _mock_notifications(monkeypatch):
+    """Prevent notification persistence in tests."""
+
+    def fake_build_and_persist(event, db):
+        return []
+
+    monkeypatch.setattr(
+        "unity_check.orchestrator.build_and_persist_notifications",
+        fake_build_and_persist,
+    )

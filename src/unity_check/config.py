@@ -30,6 +30,9 @@ class Settings(BaseSettings):
 
     git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
 
+    notify_risk_threshold: str = Field(default="medium", alias="NOTIFY_RISK_THRESHOLD")
+    notify_score_threshold: float = Field(default=70.0, alias="NOTIFY_SCORE_THRESHOLD")
+
 
 @lru_cache()
 def get_settings() -> Settings:

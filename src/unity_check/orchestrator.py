@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from unity_check.llm import semantic_review, synthesis_summary
 from unity_check.models import EvaluationRound, GithubEvent, RuleResult
+from unity_check.notification_service import build_and_persist_notifications
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,9 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
         event.evaluation_summary = event.executive_summary
         event.status = "failed"
         logger.exception("R3 synthesis exception for event_id=%s", event_id)
+
+    # ---- Post-pipeline: notification -------------------------------------
+    build_and_persist_notifications(event, db)
 
     # Build result summary.
     rounds_completed = 0
