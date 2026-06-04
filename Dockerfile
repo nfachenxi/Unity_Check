@@ -5,13 +5,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Ensure SSH doesn't refuse keys with "bad permissions" in containers.
-# Docker bind mounts typically produce 0777; we override StrictModes so
-# the key file check is skipped.  The host machine is responsible for
-# protecting the actual .ssh directory.
+# OpenSSH 10.0 removed StrictModes option entirely.
+# StrictHostKeyChecking=accept-new is passed via -o in git_service.py.
+# We still accept the host key fingerprint so Git can clone over SSH.
 RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
-    printf 'Host *\n    StrictHostKeyChecking accept-new\n    StrictModes no\n' \
-    > /etc/ssh/ssh_config.d/99-unity-check.conf
+    printf 'Host *\n' > /etc/ssh/ssh_config.d/99-unity-check.conf
 
 WORKDIR /app
 

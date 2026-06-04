@@ -47,13 +47,29 @@ def _repo_name_from_url(clone_url: str) -> str:
 
 
 def _ssh_command() -> str | None:
-    """Build GIT_SSH_COMMAND value when a key path is configured."""
+    """Build GIT_SSH_COMMAND value when a key path is configured.
+
+    OpenSSH 10.0 removed StrictModes; StrictHostKeyChecking=accept-new
+    is passed via -o here.  Docker bind mounts on Windows enforce 0777
+    which OpenSSH rejects, so we copy the key to a writable path first.
+    """
     key_path = settings.git_ssh_key_path.strip()
     if not key_path:
         return None
     if not os.path.exists(key_path):
         raise GitServiceError(f"SSH key not found: {key_path}")
-    return f"ssh -i {key_path} -o StrictHostKeyChecking=accept-new"
+    # Copy key to a protected, writable location so OpenSSH accepts it.
+    safe_dir = os.path.expanduser("~/.ssh_keys")
+    os.makedirs(safe_dir, mode=0o700, exist_ok=True)
+    safe_key = os.path.join(safe_dir, "id_rsa")
+    if not os.path.exists(safe_key):
+        import shutil
+        shutil.copy2(key_path, safe_key)
+        os.chmod(safe_key, 0o600)
+    return (
+        f"ssh -i {safe_key} -o StrictHostKeyChecking=accept-new "
+        f"-o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null"
+    )
 
 
 def ensure_bare_repo(clone_url: str) -> str:
@@ -78,12 +94,16 @@ def ensure_bare_repo(clone_url: str) -> str:
             logger.info("Fetching existing bare repo: %s", bare_path)
             try:
                 repo = git.Repo(bare_path)
+                # GitPython 3.1.50 Remote.fetch_refspec raises AttributeError
+                # (not returns None).  Check via raw git-config instead.
+                try:
+                    has_refspec = bool(repo.git.config("--get", "remote.origin.fetch"))
+                except Exception:
+                    has_refspec = False
+                if not has_refspec:
+                    repo.git.remote("set-url", "origin", clone_url)
+                    repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
                 origin = repo.remote("origin")
-                # Ensure fetch refspec is set (local path clones may lack it)
-                if not origin.fetch_refspec:
-                    repo.git.config(
-                        f"--add remote.origin.fetch +refs/heads/*:refs/heads/*"
-                    )
                 origin.fetch(env=env)
             except Exception as exc:
                 raise GitServiceError(

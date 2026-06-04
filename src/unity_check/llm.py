@@ -23,6 +23,15 @@ MAX_DIFF_CHARS = 8000
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2.0  # seconds: 2 → 4 → 8
 
+_MD_FENCE_RE = __import__("re").compile(r"^```(?:json)?\s*\n(.*?)```\s*$", __import__("re").DOTALL)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove a single outermost ```json / ``` fence if present."""
+    s = text.strip()
+    m = _MD_FENCE_RE.match(s)
+    return m.group(1) if m else s
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
@@ -153,8 +162,10 @@ def _call_llm_with_retry(
             content = response.choices[0].message.content or ""
             tokens = (response.usage.total_tokens if response.usage else 0)
 
-            # Attempt JSON parse; retry if it fails.
-            parsed = json.loads(content)
+            # Strip ```json / ``` fences that DeepSeek tends to wrap JSON in.
+            content_stripped = _strip_markdown_fences(content)
+
+            parsed = json.loads(content_stripped)
             return {
                 "result": parsed,
                 "tokens_used": tokens,
