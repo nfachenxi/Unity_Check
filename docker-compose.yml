@@ -1,4 +1,28 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: unitycheck
+      POSTGRES_PASSWORD: unitycheck
+      POSTGRES_DB: unitycheck
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U unitycheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   api:
     build: .
     ports:
@@ -10,6 +34,9 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    depends_on:
+      - db
+      - redis
 
   worker:
     build: .
@@ -21,13 +48,16 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    depends_on:
+      - db
+      - redis
 
   roslyn:
     build:
       context: ./roslyn-analyzer
       dockerfile: Dockerfile
     ports:
-      - "5000:8080"
+      - "8080:8080"
     restart: unless-stopped
 
 volumes:

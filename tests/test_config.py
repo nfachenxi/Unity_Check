@@ -65,12 +65,12 @@ class TestSettingsLoading:
         assert settings.git_ssh_key_path == "/home/user/.ssh/id_rsa"
 
     def test_roslyn_service_url_defaults(self, monkeypatch):
-        """ROSLYN_SERVICE_URL should default to http://roslyn:5000."""
+        """ROSLYN_SERVICE_URL should default to http://roslyn:8080."""
         monkeypatch.setenv("DATABASE_URL", "postgresql://test")
         monkeypatch.setenv("REDIS_URL", "redis://test")
         monkeypatch.setenv("GITHUB_REMOTE_REPO", "git@test")
         settings = Settings(_env_file=None)
-        assert settings.roslyn_service_url == "http://roslyn:5000"
+        assert settings.roslyn_service_url == "http://roslyn:8080"
 
     def test_roslyn_service_url_from_env(self, monkeypatch):
         """ROSLYN_SERVICE_URL should be read from env."""

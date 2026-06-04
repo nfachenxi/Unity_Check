@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from unity_check.db import get_db
 from unity_check.main import app
-from unity_check.models import GithubEvent, RuleResult
+from unity_check.models import EvaluationRound, GithubEvent, RuleResult
 
 
 def _fake_task_id() -> str:

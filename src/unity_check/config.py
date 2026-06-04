@@ -25,8 +25,10 @@ class Settings(BaseSettings):
 
     git_ssh_key_path: str = Field(default="", alias="GIT_SSH_KEY_PATH")
 
-    roslyn_service_url: str = Field(default="http://roslyn:5000", alias="ROSLYN_SERVICE_URL")
+    roslyn_service_url: str = Field(default="http://roslyn:8080", alias="ROSLYN_SERVICE_URL")
     default_analyze_paths: str = Field(default="Assets/Scripts", alias="DEFAULT_ANALYZE_PATHS")
+
+    git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
 
 
 @lru_cache()

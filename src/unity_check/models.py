@@ -7,7 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from unity_check.db import Base
 
 if TYPE_CHECKING:
-    from unity_check.models import RuleResult
+    from unity_check.models import EvaluationRound, RuleResult
 
 
 class GithubEvent(Base):
@@ -28,6 +28,10 @@ class GithubEvent(Base):
     task_id: Mapped[str | None] = mapped_column(String(64), index=True)
     risk_level: Mapped[str | None] = mapped_column(String(16))
     evaluation_summary: Mapped[str | None] = mapped_column(Text)
+    overall_score: Mapped[float | None] = mapped_column()
+    final_risk_level: Mapped[str | None] = mapped_column(String(16))
+    recommendation: Mapped[str | None] = mapped_column(String(32))
+    executive_summary: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -38,6 +42,9 @@ class GithubEvent(Base):
 
     # relationships
     rule_results: Mapped[list["RuleResult"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan"
+    )
+    evaluation_rounds: Mapped[list["EvaluationRound"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
 
@@ -72,6 +79,43 @@ class RuleResult(Base):
 
     # relationships
     event: Mapped["GithubEvent"] = relationship(back_populates="rule_results")
+
+
+class EvaluationRound(Base):
+    """One round of evaluation within the multi-round pipeline.
+
+    Round 1 (rule_check): Roslyn static-analysis summary — populated from rule_results.
+    Round 2 (semantic_review): LLM semantic review — architecture / design / Unity anti-patterns.
+    Round 3 (synthesis): LLM synthesis — overall score, risk level, recommendation.
+    """
+
+    __tablename__ = "evaluation_rounds"
+    __table_args__ = (
+        Index("idx_eval_rounds_event_round", "event_id", "round_number"),
+        Index("idx_eval_rounds_event_type", "event_id", "round_type"),
+        Index("idx_eval_rounds_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("github_events.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    round_number: Mapped[int] = mapped_column()  # 1, 2, 3
+    round_type: Mapped[str] = mapped_column(String(32))  # rule_check / semantic_review / synthesis
+    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/success/failed/skipped
+    input_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)  # summary of inputs fed to this round
+    output_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)  # structured output from this round
+    score: Mapped[float | None] = mapped_column()  # overall score (R3)
+    model_name: Mapped[str | None] = mapped_column(String(64))  # LLM model used
+    tokens_used: Mapped[int | None] = mapped_column()  # prompt + completion tokens
+    duration_ms: Mapped[int | None] = mapped_column()  # wall-clock duration
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # relationships
+    event: Mapped["GithubEvent"] = relationship(back_populates="evaluation_rounds")
 
 
 class RepoScanConfig(Base):

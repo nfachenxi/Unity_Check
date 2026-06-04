@@ -63,9 +63,7 @@ def ensure_bare_repo(clone_url: str) -> str:
     """
     import git
 
-    clone_base = os.path.abspath(
-        os.environ.get("GIT_CLONE_BASE_DIR", "./repos")
-    )
+    clone_base = os.path.abspath(settings.git_clone_base_dir)
     repo_dir = _repo_name_from_url(clone_url)
     bare_path = os.path.join(clone_base, f"{repo_dir}.git")
 

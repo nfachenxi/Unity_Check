@@ -12,8 +12,8 @@ from unity_check.git_service import (
     extract_clone_url_from_payload,
     get_diff,
 )
-from unity_check.llm import evaluate_with_llm
 from unity_check.models import GithubEvent
+from unity_check.orchestrator import run_evaluation_pipeline
 from unity_check.rule_service import (
     ensure_repo_scan_config,
     extract_cs_files_from_diff,
@@ -71,21 +71,6 @@ def _run_git_workflow(event: GithubEvent) -> None:
     diff = get_diff(bare_path, before_sha, after_sha)
     event.diff_content = diff
     event.diff_size = len(diff.encode("utf-8"))
-
-
-def build_event_summary(event: GithubEvent) -> str:
-    # Build a compact summary that can be fed directly to the model.
-    payload = event.payload or {}
-    if event.event_type == "push":
-        commit_count = len(payload.get("commits", []))
-        ref = payload.get("ref", "unknown")
-        return f"push to {ref}, commits={commit_count}"
-    if event.event_type == "pull_request":
-        pr = payload.get("pull_request") or {}
-        pr_number = pr.get("number", payload.get("number", "unknown"))
-        title = pr.get("title", "")
-        return f"pull_request #{pr_number}, action={event.action or 'unknown'}, title={title}"
-    return f"event={event.event_type}, action={event.action or 'none'}"
 
 
 def _ensure_baseline_scan(
@@ -197,7 +182,6 @@ def process_github_event(event_id: int) -> dict[str, str]:
 
         with db.begin_nested():
             event.status = "running"
-            summary = build_event_summary(event)
 
             # Git workflow: clone/fetch → diff (runs outside the savepoint).
             # On failure we catch GitServiceError, record the error, and
@@ -221,22 +205,13 @@ def process_github_event(event_id: int) -> dict[str, str]:
                     rule_count, event_id,
                 )
 
-            llm_result = evaluate_with_llm(
-                event.event_type,
-                event.action,
-                summary,
-                diff_content=event.diff_content or "",
-            )
-            event.risk_level = llm_result.get("risk_level", "unknown")
-            event.evaluation_summary = llm_result.get("summary", summary)
-            event.status = "success"
-        db.commit()
-
-        return {
-            "status": "success",
-            "event_id": str(event_id),
-            "risk_level": str(event.risk_level),
-        }
+            # Multi-round evaluation pipeline (P3).
+            # Replaces the old single-round evaluate_with_llm call.
+            pipeline_result = run_evaluation_pipeline(event, db)
+            # The orchestrator already sets event.risk_level, evaluation_summary,
+            # overall_score, final_risk_level, recommendation, executive_summary,
+            # and event.status — no further assignment needed here.
+            event_status = pipeline_result.get("status", "success")
     except Exception as exc:
         # Persist failure details so the pipeline can be traced from UI/query endpoints.
         logger.exception("Task failed for event_id=%s", event_id)
@@ -250,6 +225,13 @@ def process_github_event(event_id: int) -> dict[str, str]:
                 )
             db.commit()
         return {"status": "failed", "event_id": str(event_id), "error": str(exc)}
+    else:
+        db.commit()
+        return {
+            "status": event_status,
+            "event_id": str(event_id),
+            "risk_level": str(event.risk_level),
+        }
     finally:
         db.close()
 

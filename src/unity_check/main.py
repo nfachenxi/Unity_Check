@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db
 from unity_check.git_service import extract_sha_from_payload
-from unity_check.models import GithubEvent, RepoScanConfig, RuleResult
+from unity_check.models import EvaluationRound, GithubEvent, RepoScanConfig, RuleResult
 from unity_check.rule_service import (
     ensure_repo_scan_config,
     get_analyze_paths,
@@ -366,13 +366,11 @@ def trigger_baseline_scan(
         }
 
     # We need the repo's local path.  Since this is a manual trigger, use the
-    # configured GIT_CLONE_BASE_DIR + repo name to locate it.
+    # configured git_clone_base_dir + repo name to locate it.
     import os
     from unity_check.git_service import _repo_name_from_url as git_repo_name
 
-    clone_base = os.path.abspath(
-        os.environ.get("GIT_CLONE_BASE_DIR", "./repos")
-    )
+    clone_base = os.path.abspath(settings.git_clone_base_dir)
     # Try to find existing clone path; for manual trigger we try SSH format.
     bare_candidate = os.path.join(
         clone_base, f"{git_repo_name(f'git@github.com:{name}.git')}.git"
@@ -402,4 +400,115 @@ def trigger_baseline_scan(
         "repository": name,
         "task_id": task.id,
         "message": "Baseline scan dispatched.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# P3: Multi-round evaluation endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/events/{event_id}/evaluations")
+def get_event_evaluations(event_id: int, db: Session = Depends(get_db)) -> list[dict]:
+    """Return all evaluation rounds for an event, ordered by round_number."""
+    event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+
+    rounds = db.scalars(
+        select(EvaluationRound)
+        .where(EvaluationRound.event_id == event_id)
+        .order_by(EvaluationRound.round_number)
+    ).all()
+
+    return [
+        {
+            "id": r.id,
+            "round_number": r.round_number,
+            "round_type": r.round_type,
+            "status": r.status,
+            "score": r.score,
+            "model_name": r.model_name,
+            "tokens_used": r.tokens_used,
+            "duration_ms": r.duration_ms,
+            "error_message": r.error_message,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rounds
+    ]
+
+
+@app.get("/events/{event_id}/assessment")
+def get_event_assessment(event_id: int, db: Session = Depends(get_db)) -> dict:
+    """Return the final assessment for an event.
+
+    Combines the GithubEvent-level summary fields with an aggregated view
+    of the evaluation rounds.
+    """
+    event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+
+    rounds = db.scalars(
+        select(EvaluationRound)
+        .where(EvaluationRound.event_id == event_id)
+        .order_by(EvaluationRound.round_number)
+    ).all()
+
+    return {
+        "event_id": event.id,
+        "status": event.status,
+        "overall_score": event.overall_score,
+        "final_risk_level": event.final_risk_level,
+        "recommendation": event.recommendation,
+        "executive_summary": event.executive_summary,
+        "rounds": [
+            {
+                "round_number": r.round_number,
+                "round_type": r.round_type,
+                "status": r.status,
+                "score": r.score,
+                "tokens_used": r.tokens_used,
+                "duration_ms": r.duration_ms,
+            }
+            for r in rounds
+        ],
+        "total_tokens_used": sum(r.tokens_used or 0 for r in rounds),
+        "total_duration_ms": sum(r.duration_ms or 0 for r in rounds),
+    }
+
+
+@app.post("/events/{event_id}/re-evaluate")
+def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
+    """Delete existing evaluation rounds and re-trigger the full pipeline."""
+    event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+
+    # Remove old evaluation rounds.
+    db.query(EvaluationRound).filter(EvaluationRound.event_id == event_id).delete()
+    db.flush()
+
+    # Reset event status and evaluation fields.
+    event.status = "queued"
+    event.risk_level = None
+    event.evaluation_summary = None
+    event.overall_score = None
+    event.final_risk_level = None
+    event.recommendation = None
+    event.executive_summary = None
+    db.flush()
+
+    # Re-enqueue the pipeline task.
+    task = process_github_event.delay(event.id)
+    event.task_id = task.id
+    db.commit()
+
+    return {
+        "status": "accepted",
+        "event_id": event.id,
+        "task_id": task.id,
+        "message": "Re-evaluation triggered.",
     }

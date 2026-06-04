@@ -255,7 +255,7 @@ class TestEnsureBareRepo:
 
         # Override CLONE_BASE_DIR
         clone_base = tmp_path / "clones"
-        monkeypatch.setenv("GIT_CLONE_BASE_DIR", str(clone_base))
+        monkeypatch.setattr("unity_check.git_service.settings.git_clone_base_dir", str(clone_base))
         # Clear SSH key path so we don't try to use SSH
         monkeypatch.setattr("unity_check.git_service.settings.git_ssh_key_path", "")
 
@@ -269,7 +269,7 @@ class TestEnsureBareRepo:
         subprocess.run(["git", "init", "--bare", str(src)], check=True, capture_output=True)
 
         clone_base = tmp_path / "clones"
-        monkeypatch.setenv("GIT_CLONE_BASE_DIR", str(clone_base))
+        monkeypatch.setattr("unity_check.git_service.settings.git_clone_base_dir", str(clone_base))
         monkeypatch.setattr("unity_check.git_service.settings.git_ssh_key_path", "")
 
         # First call clones — succeeds
@@ -292,7 +292,7 @@ class TestEnsureBareRepo:
         subprocess.run(["git", "init", "--bare", str(src)], check=True, capture_output=True)
 
         clone_base = tmp_path / "clones"
-        monkeypatch.setenv("GIT_CLONE_BASE_DIR", str(clone_base))
+        monkeypatch.setattr("unity_check.git_service.settings.git_clone_base_dir", str(clone_base))
         monkeypatch.setattr(
             "unity_check.git_service.settings.git_ssh_key_path", "/nonexistent/ssh_key"
         )

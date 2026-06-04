@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from unity_check.db import Base
-from unity_check.models import GithubEvent, RepoScanConfig, RuleResult  # noqa: F401 — register ORM table
+from unity_check.models import EvaluationRound, GithubEvent, RepoScanConfig, RuleResult  # noqa: F401 — register ORM tables
 
 
 @pytest.fixture(scope="session")
@@ -42,8 +42,45 @@ def _mock_llm(monkeypatch):
     def fake_evaluate(event_type, action, summary, diff_content=""):
         return {"risk_level": "low", "summary": "mocked summary"}
 
+    def fake_semantic_review(diff_content, rule_results_summary, event_summary):
+        return {
+            "findings": [
+                {
+                    "title": "Mocked finding",
+                    "category": "architecture",
+                    "severity": "low",
+                    "description": "Mocked description",
+                    "suggestion": "Mocked suggestion",
+                }
+            ],
+            "tokens_used": 100,
+            "duration_ms": 500,
+            "model_name": "deepseek-chat-mock",
+        }
+
+    def fake_synthesis_summary(diff_content, rule_results_summary, r2_findings, event_summary):
+        return {
+            "overall_score": 85.0,
+            "risk_level": "low",
+            "executive_summary": "Mocked executive summary.",
+            "top_issues": [
+                {"title": "Mocked issue", "severity": "low", "source": "semantic_review"},
+            ],
+            "recommendation": "merge_ready",
+            "action_items": [
+                {"action": "Mocked action", "priority": "low"},
+            ],
+            "tokens_used": 200,
+            "duration_ms": 800,
+            "model_name": "deepseek-chat-mock",
+        }
+
     monkeypatch.setattr("unity_check.llm.evaluate_with_llm", fake_evaluate)
-    monkeypatch.setattr("unity_check.tasks.evaluate_with_llm", fake_evaluate)
+    monkeypatch.setattr("unity_check.llm.semantic_review", fake_semantic_review)
+    monkeypatch.setattr("unity_check.llm.synthesis_summary", fake_synthesis_summary)
+    monkeypatch.setattr("unity_check.orchestrator.semantic_review", fake_semantic_review)
+    monkeypatch.setattr("unity_check.orchestrator.synthesis_summary", fake_synthesis_summary)
+    # tasks.py no longer imports evaluate_with_llm; it uses run_evaluation_pipeline directly.
 
 
 @pytest.fixture(autouse=True)

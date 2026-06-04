@@ -6,7 +6,6 @@ from sqlalchemy import text
 from unity_check.models import GithubEvent
 from unity_check.tasks import (
     _resolve_clone_url,
-    build_event_summary,
     process_github_event,
 )
 
@@ -15,47 +14,6 @@ from unity_check.tasks import (
 def _override_session_local(monkeypatch, session):
     """Make SessionLocal return the test session so task can use it."""
     monkeypatch.setattr("unity_check.tasks.SessionLocal", lambda: session)
-
-
-# ---------------------------------------------------------------------------
-# build_event_summary
-# ---------------------------------------------------------------------------
-class TestBuildEventSummary:
-    def test_push_summary(self):
-        event = GithubEvent(
-            event_type="push",
-            payload={"ref": "refs/heads/main", "commits": [{}, {}]},
-        )
-        summary = build_event_summary(event)
-        assert "push to refs/heads/main" in summary
-        assert "commits=2" in summary
-
-    def test_pr_summary(self):
-        event = GithubEvent(
-            event_type="pull_request",
-            action="opened",
-            payload={
-                "pull_request": {"number": 42, "title": "Fix bug"},
-            },
-        )
-        summary = build_event_summary(event)
-        assert "pull_request #42" in summary
-        assert "action=opened" in summary
-        assert "Fix bug" in summary
-
-    def test_pr_summary_fallback_when_pr_key_missing(self):
-        event = GithubEvent(
-            event_type="pull_request",
-            action="synchronize",
-            payload={"number": 99},
-        )
-        summary = build_event_summary(event)
-        assert "#99" in summary
-
-    def test_unknown_event_type_summary(self):
-        event = GithubEvent(event_type="issues", action="opened", payload={})
-        summary = build_event_summary(event)
-        assert "issues" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +91,7 @@ class TestProcessGithubEvent:
         session.expunge(event)
 
         with patch(
-            "unity_check.tasks.evaluate_with_llm",
+            "unity_check.tasks.run_evaluation_pipeline",
             side_effect=RuntimeError("LLM timeout"),
         ):
             result = process_github_event(event_id)
@@ -183,7 +141,7 @@ class TestProcessGithubEvent:
         session.expunge(event)
 
         with patch(
-            "unity_check.tasks.evaluate_with_llm",
+            "unity_check.tasks.run_evaluation_pipeline",
             side_effect=RuntimeError("LLM crash"),
         ):
             result = process_github_event(event_id)
