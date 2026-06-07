@@ -141,47 +141,66 @@ def _generate_rule_results(event_id: int) -> list[RuleResult]:
 
 
 def _generate_evaluation_rounds(event_id: int, overall_score: float | None,
-                                 final_risk_level: str | None) -> list[EvaluationRound]:
-    """为单个事件生成 R1/R2/R3 评估轮次记录。"""
+                                 final_risk_level: str | None,
+                                 dim_a_score: float | None,
+                                 dim_b_score: float | None) -> list[EvaluationRound]:
+    """为单个事件生成 R1/R3 + 每个文件维度 A/B 评估轮次记录。"""
     now = datetime.now(timezone.utc)
     rounds: list[EvaluationRound] = []
 
-    # R1: rule_check — success
+    # ---- R1: rule_check ----
     rounds.append(EvaluationRound(
         event_id=event_id, round_number=1, round_type="rule_check",
         status="success", score=None, model_name="roslyn-docker",
         tokens_used=0, duration_ms=random.randint(200, 1500),
         input_summary={"diff_size": random.randint(500, 5000)},
         output_data={"total": random.randint(0, 8), "note": "seeded history"},
-        started_at=now - timedelta(seconds=random.randint(30, 60)),
-        completed_at=now - timedelta(seconds=random.randint(25, 55)),
+        started_at=now - timedelta(seconds=random.randint(60, 90)),
+        completed_at=now - timedelta(seconds=random.randint(55, 85)),
     ))
 
-    # R2: semantic_review — 90% success
-    r2_success = random.random() < 0.9
-    if r2_success:
-        findings = random.sample(SEMANTIC_FINDING_POOL, min(random.randint(1, 4), len(SEMANTIC_FINDING_POOL)))
-        rounds.append(EvaluationRound(
-            event_id=event_id, round_number=2, round_type="semantic_review",
-            status="success", score=None, model_name="deepseek-chat",
-            tokens_used=random.randint(2000, 8000), duration_ms=random.randint(8000, 25000),
-            output_data={"findings": findings},
-            started_at=now - timedelta(seconds=random.randint(25, 55)),
-            completed_at=now - timedelta(seconds=random.randint(5, 20)),
-        ))
-    else:
-        rounds.append(EvaluationRound(
-            event_id=event_id, round_number=2, round_type="semantic_review",
-            status="failed", model_name="deepseek-chat",
-            tokens_used=0, duration_ms=random.randint(3000, 10000),
-            error_message="Simulated API timeout",
-            started_at=now - timedelta(seconds=random.randint(25, 55)),
-            completed_at=now - timedelta(seconds=random.randint(5, 20)),
-        ))
+    # ---- R2: 每个文件两个维度评估 ----
+    files_changed = random.sample(FILE_POOL, min(random.randint(2, 5), len(FILE_POOL)))
+    round_num = 2
 
-    # R3: synthesis
+    for file_path in files_changed:
+        # 维度 A: functionality_best_practices
+        a_findings = random.sample(SEMANTIC_FINDING_POOL, min(random.randint(1, 2), len(SEMANTIC_FINDING_POOL)))
+        rounds.append(EvaluationRound(
+            event_id=event_id, round_number=round_num, round_type="functionality_best_practices",
+            file_path=file_path,
+            status="success", score=dim_a_score, model_name="deepseek-chat",
+            tokens_used=random.randint(2000, 6000), duration_ms=random.randint(5000, 15000),
+            output_data={
+                "score": dim_a_score,
+                "summary": f"功能/最佳实践评估完成: {file_path}",
+                "findings": a_findings,
+            },
+            started_at=now - timedelta(seconds=random.randint(25, 55)),
+            completed_at=now - timedelta(seconds=random.randint(5, 20)),
+        ))
+        round_num += 1
+
+        # 维度 B: security_performance_health
+        b_findings = random.sample(SEMANTIC_FINDING_POOL, min(random.randint(1, 2), len(SEMANTIC_FINDING_POOL)))
+        rounds.append(EvaluationRound(
+            event_id=event_id, round_number=round_num, round_type="security_performance_health",
+            file_path=file_path,
+            status="success", score=dim_b_score, model_name="deepseek-chat",
+            tokens_used=random.randint(2000, 6000), duration_ms=random.randint(5000, 15000),
+            output_data={
+                "score": dim_b_score,
+                "summary": f"安全/性能/健康度评估完成: {file_path}",
+                "findings": b_findings,
+            },
+            started_at=now - timedelta(seconds=random.randint(25, 55)),
+            completed_at=now - timedelta(seconds=random.randint(5, 20)),
+        ))
+        round_num += 1
+
+    # ---- R3: synthesis ----
     rounds.append(EvaluationRound(
-        event_id=event_id, round_number=3, round_type="synthesis",
+        event_id=event_id, round_number=99, round_type="synthesis",
         status="success", score=overall_score, model_name="deepseek-chat",
         tokens_used=random.randint(3000, 12000), duration_ms=random.randint(5000, 18000),
         output_data={
@@ -244,6 +263,9 @@ def seed_history(count: int = 50, days: int = 21) -> int:
 
             risk = _risk_for_day_offset(day_offset, days)
             score = _score_for_risk(risk)
+            # 维度评分：B 维度普遍低于 A 维度（模拟安全/性能问题更多）
+            dim_a = round(min(99, score + random.uniform(5, 20)), 1)
+            dim_b = round(max(10, score - random.uniform(10, 25)), 1)
 
             diff = _random_diff(random.randint(1, 5))
             diff_size = len(diff.encode("utf-8"))
@@ -264,9 +286,12 @@ def seed_history(count: int = 50, days: int = 21) -> int:
                     "repository": {"full_name": repo},
                 },
                 status="success",
-                risk_level=risk,
                 overall_score=score,
                 final_risk_level=risk,
+                dimension_a_score=dim_a,
+                dimension_b_score=dim_b,
+                dimension_a_summary=f"功能/最佳实践评分 {dim_a}/100",
+                dimension_b_summary=f"安全/性能/健康度评分 {dim_b}/100",
                 recommendation="merge_ready" if risk == "low" else "needs_review",
                 executive_summary=(
                     f"本次提交包含 C# 代码变更，经三轮评估综合评分为 {score}，"
@@ -284,7 +309,7 @@ def seed_history(count: int = 50, days: int = 21) -> int:
                 db.add_all(rules)
 
             # Evaluation rounds
-            rounds = _generate_evaluation_rounds(int(event.id), score, risk)
+            rounds = _generate_evaluation_rounds(int(event.id), score, risk, dim_a, dim_b)
             db.add_all(rounds)
 
             db.flush()
