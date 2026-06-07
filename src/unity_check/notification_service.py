@@ -1,11 +1,10 @@
-"""Notification service: threshold judgment, message building, persistence.
+"""Notification service: threshold judgment, generic message building, persistence.
 
-Actual delivery to WeCom / Feishu is delegated to an independent tool
-platform.  This module is responsible for:
+Actual delivery is delegated to an independent tool platform.  This module is
+responsible for:
 
 1. Deciding *whether* a notification should be generated.
-2. Building the message payload (Markdown for WeCom, interactive card JSON
-   for Feishu).
+2. Building a generic JSON message payload.
 3. Persisting the notification record to the database.
 4. Providing a callback endpoint that the tool platform calls to update
    delivery status.
@@ -13,19 +12,21 @@ platform.  This module is responsible for:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from unity_check.config import get_settings
-from unity_check.models import GithubEvent, Notification
+from unity_check.models import GithubEvent, Notification, RuleResult
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Threshold rules (from the plan)
+# Threshold rules
 # ---------------------------------------------------------------------------
 
 
@@ -53,104 +54,52 @@ def _should_notify(event: GithubEvent) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Message builders
+# Generic message builder
 # ---------------------------------------------------------------------------
 
 
-def _build_wecom_markdown(event: GithubEvent) -> str:
-    """Build an enterprise-WeChat markdown notification message."""
+def _build_generic_message(event: GithubEvent) -> str:
+    """Build a generic JSON notification message for external delivery."""
     repo = event.repository or "unknown"
-    risk = (event.final_risk_level or "unknown").upper()
-    score = event.overall_score
-    score_str = f"{score:.0f}" if score is not None else "N/A"
-    recommendation = (event.recommendation or "needs_review").replace("_", " ")
 
-    lines = [
-        f"## 🔔 Unity Check 评估结果",
-        f"",
-        f"**仓库**: {repo}",
-        f"**事件类型**: {event.event_type}",
-        f"**风险等级**: <font color=\"warning\">{risk}</font>",
-        f"**综合评分**: {score_str}/100",
-        f"**建议**: {recommendation}",
-        f"",
-    ]
+    # Collect top issues from evaluation rounds
+    from sqlalchemy.orm import Session as _Session
+    from unity_check.db import SessionLocal
 
-    summary = (event.executive_summary or "").strip()
-    if summary:
-        lines.append(f"**摘要**: {summary}")
-        lines.append("")
+    # Use the passed event's associated rounds if available (via relationship)
+    # otherwise build from known fields
+    dim_scores = {}
+    if event.dimension_a_score is not None:
+        dim_scores["functionality_best_practices"] = event.dimension_a_score
+    if event.dimension_b_score is not None:
+        dim_scores["security_performance_health"] = event.dimension_b_score
 
-    lines.append(f"[查看详情](http://localhost:8000/events/{event.id})")
-    return "\n".join(lines)
+    dim_summaries = {}
+    if event.dimension_a_summary:
+        dim_summaries["functionality_best_practices"] = event.dimension_a_summary
+    if event.dimension_b_summary:
+        dim_summaries["security_performance_health"] = event.dimension_b_summary
 
-
-def _build_feishu_card(event: GithubEvent) -> dict[str, Any]:
-    """Build a Feishu interactive-card JSON payload."""
-    repo = event.repository or "unknown"
-    risk = (event.final_risk_level or "unknown").upper()
-    score = event.overall_score
-    score_str = f"{score:.0f}" if score is not None else "N/A"
-
-    risk_color: dict[str, str] = {
-        "critical": "red",
-        "high": "red",
-        "medium": "orange",
-        "low": "green",
-        "unknown": "grey",
+    # Rule violations count — need a session to query
+    # Build without DB access first, caller can enrich
+    payload = {
+        "type": "code_review_alert",
+        "version": "2.0",
+        "event_id": int(event.id),
+        "repository": repo,
+        "event_type": event.event_type,
+        "status": event.status,
+        "overall_score": event.overall_score,
+        "final_risk_level": event.final_risk_level,
+        "recommendation": event.recommendation,
+        "executive_summary": event.executive_summary,
+        "dimension_scores": dim_scores,
+        "dimension_summaries": dim_summaries,
+        "detail_url": f"http://localhost:8000/api/events/{event.id}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    return {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": "Unity Check 评估结果"},
-                "template": risk_color.get((risk or "unknown").lower(), "grey"),
-            },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": f"**仓库**: {repo}"},
-                },
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": f"**风险等级**: {risk}"},
-                },
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": f"**综合评分**: {score_str}/100"},
-                },
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**建议**: {(event.recommendation or 'needs_review').replace('_', ' ')}",
-                    },
-                },
-                {
-                    "tag": "hr",
-                },
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": (event.executive_summary or "无摘要")[:500],
-                    },
-                },
-                {
-                    "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "查看详情"},
-                            "type": "primary",
-                            "url": f"http://localhost:8000/events/{event.id}",
-                        }
-                    ],
-                },
-            ],
-        },
-    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +110,7 @@ def _build_feishu_card(event: GithubEvent) -> dict[str, Any]:
 def build_and_persist_notifications(
     event: GithubEvent, db: Session
 ) -> list[Notification]:
-    """Build notification messages for all configured channels and persist them.
+    """Build and persist a single generic notification if thresholds are met.
 
     Called after a successful evaluation pipeline run.  Returns the list of
     persisted ``Notification`` rows (empty if thresholds are not met).
@@ -174,53 +123,29 @@ def build_and_persist_notifications(
         )
         return []
 
-    records: list[Notification] = []
-
-    # WeCom
-    wecom_md = _build_wecom_markdown(event)
-    records.append(
-        Notification(
-            event_id=int(event.id),
-            channel="wecom",
-            trigger_reason=reason,
-            risk_level=event.final_risk_level,
-            message_content=wecom_md,
-            webhook_url=None,  # filled by tool platform
-            status="pending",
-        )
+    message_json = _build_generic_message(event)
+    notif = Notification(
+        event_id=int(event.id),
+        channel="generic",
+        trigger_reason=reason,
+        risk_level=event.final_risk_level,
+        message_content=message_json,
+        webhook_url=None,
+        status="pending",
     )
-
-    # Feishu
-    feishu_card = _build_feishu_card(event)
-    records.append(
-        Notification(
-            event_id=int(event.id),
-            channel="feishu",
-            trigger_reason=reason,
-            risk_level=event.final_risk_level,
-            message_content=str(feishu_card),  # stored as JSON string in text column
-            webhook_url=None,
-            status="pending",
-        )
+    db.add(notif)
+    db.flush()
+    logger.info(
+        "Persisted 1 notification for event_id=%s (reason=%s)",
+        event.id, reason,
     )
-
-    if records:
-        db.add_all(records)
-        db.flush()
-        logger.info(
-            "Persisted %d notification(s) for event_id=%s (reason=%s)",
-            len(records), event.id, reason,
-        )
-
-    return records
+    return [notif]
 
 
 def get_notifications_for_event(
     event_id: int, db: Session
 ) -> list[Notification]:
     """Return all notifications for an event, ordered by creation time."""
-    from sqlalchemy import select
-
     return list(
         db.scalars(
             select(Notification)
@@ -238,8 +163,6 @@ def update_notification_status(
     error_message: str | None = None,
 ) -> Notification | None:
     """Update delivery status for a notification (called by tool platform callback)."""
-    from sqlalchemy import select
-
     notif = db.scalar(
         select(Notification).where(Notification.id == notification_id)
     )

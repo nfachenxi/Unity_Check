@@ -259,7 +259,7 @@ def main() -> None:
 
     if args.re_evaluate:
         import requests
-        resp = requests.post(f"http://localhost:8000/events/{args.event_id}/re-evaluate")
+        resp = requests.post(f"http://localhost:8000/api/events/{args.event_id}/re-evaluate")
         if resp.status_code == 200:
             logger.info("已触发 event_id=%s 重新评估", args.event_id)
         else:

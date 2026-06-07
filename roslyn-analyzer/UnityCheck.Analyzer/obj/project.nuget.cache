@@ -1,13 +1,13 @@
 {
   "version": 2,
-  "dgSpecHash": "hws1dBmEIA8=",
+  "dgSpecHash": "+UTi5/tGQ8E=",
   "success": true,
   "projectFilePath": "F:\\work\\Project\\roslyn-analyzer\\UnityCheck.Analyzer\\UnityCheck.Analyzer.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\NFA\\.nuget\\packages\\microsoft.codeanalysis.analyzers\\3.3.4\\microsoft.codeanalysis.analyzers.3.3.4.nupkg.sha512",
     "C:\\Users\\NFA\\.nuget\\packages\\microsoft.codeanalysis.common\\4.9.2\\microsoft.codeanalysis.common.4.9.2.nupkg.sha512",
     "C:\\Users\\NFA\\.nuget\\packages\\microsoft.codeanalysis.csharp\\4.9.2\\microsoft.codeanalysis.csharp.4.9.2.nupkg.sha512",
-    "C:\\Users\\NFA\\.nuget\\packages\\microsoft.codeanalysis.netanalyzers\\9.0.0\\microsoft.codeanalysis.netanalyzers.9.0.0.nupkg.sha512",
+    "C:\\Users\\NFA\\.nuget\\packages\\microsoft.codeanalysis.netanalyzers\\8.0.0\\microsoft.codeanalysis.netanalyzers.8.0.0.nupkg.sha512",
     "C:\\Users\\NFA\\.nuget\\packages\\roslynator.analyzers\\4.12.4\\roslynator.analyzers.4.12.4.nupkg.sha512",
     "C:\\Users\\NFA\\.nuget\\packages\\stylecop.analyzers\\1.2.0-beta.556\\stylecop.analyzers.1.2.0-beta.556.nupkg.sha512",
     "C:\\Users\\NFA\\.nuget\\packages\\stylecop.analyzers.unstable\\1.2.0.556\\stylecop.analyzers.unstable.1.2.0.556.nupkg.sha512",

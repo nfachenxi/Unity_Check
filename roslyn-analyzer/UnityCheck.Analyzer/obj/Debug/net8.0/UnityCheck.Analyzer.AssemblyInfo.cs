@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("UnityCheck.Analyzer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8ff8e613474ca3bddcb78a4fb4eb79c766e9a1b2")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c04451c0ab1e6cfc849c3733282417b53e945033")]
 [assembly: System.Reflection.AssemblyProductAttribute("UnityCheck.Analyzer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("UnityCheck.Analyzer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

@@ -5,17 +5,17 @@ const api = axios.create({
   timeout: 30000,
 })
 
-// ---- Dashboard ----
+// ---- Dashboard (unified endpoint) ----
 export function getDashboardSummary(params) {
-  return api.get('/dashboard/summary', { params })
+  return api.get('/dashboard', { params: { ...params, section: 'summary' } })
 }
 
 export function getDashboardTrends(params) {
-  return api.get('/dashboard/trends', { params })
+  return api.get('/dashboard', { params: { ...params, section: 'trends' } })
 }
 
 export function getDashboardIssueDistribution(params) {
-  return api.get('/dashboard/issue-distribution', { params })
+  return api.get('/dashboard', { params: { ...params, section: 'distribution' } })
 }
 
 // ---- Events ----
@@ -28,7 +28,8 @@ export function getEventDetail(id) {
 }
 
 export function getEventRules(eventId, params) {
-  return api.get(`/events/${eventId}/rules`, { params })
+  // Rules are now embedded in event detail via ?include=rules
+  return api.get(`/events/${eventId}`, { params: { ...params, include: 'rules' } })
 }
 
 export function getEventEvaluations(eventId) {
@@ -36,16 +37,17 @@ export function getEventEvaluations(eventId) {
 }
 
 export function getEventAssessment(eventId) {
-  return api.get(`/events/${eventId}/assessment`)
+  // Assessment is now embedded in event detail via ?include=assessment
+  return api.get(`/events/${eventId}`, { params: { include: 'assessment' } })
 }
 
 // ---- Stats ----
 export function getStatsScores(params) {
-  return api.get('/stats/scores', { params })
+  return api.get('/dashboard', { params: { ...params, section: 'scores' } })
 }
 
 export function getStatsHotspots(params) {
-  return api.get('/stats/hotspots', { params })
+  return api.get('/dashboard', { params: { ...params, section: 'hotspots' } })
 }
 
 // ---- Notifications ----

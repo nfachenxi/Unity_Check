@@ -26,12 +26,14 @@ class GithubEvent(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     task_id: Mapped[str | None] = mapped_column(String(64), index=True)
-    risk_level: Mapped[str | None] = mapped_column(String(16))
-    evaluation_summary: Mapped[str | None] = mapped_column(Text)
     overall_score: Mapped[float | None] = mapped_column()
     final_risk_level: Mapped[str | None] = mapped_column(String(16))
     recommendation: Mapped[str | None] = mapped_column(String(32))
     executive_summary: Mapped[str | None] = mapped_column(Text)
+    dimension_a_score: Mapped[float | None] = mapped_column()
+    dimension_b_score: Mapped[float | None] = mapped_column()
+    dimension_a_summary: Mapped[str | None] = mapped_column(Text)
+    dimension_b_summary: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -85,12 +87,7 @@ class RuleResult(Base):
 
 
 class EvaluationRound(Base):
-    """One round of evaluation within the multi-round pipeline.
-
-    Round 1 (rule_check): Roslyn static-analysis summary — populated from rule_results.
-    Round 2 (semantic_review): LLM semantic review — architecture / design / Unity anti-patterns.
-    Round 3 (synthesis): LLM synthesis — overall score, risk level, recommendation.
-    """
+    """Per-file evaluation round: rule_check summary + two LLM dimensions per file."""
 
     __tablename__ = "evaluation_rounds"
     __table_args__ = (
@@ -103,8 +100,9 @@ class EvaluationRound(Base):
     event_id: Mapped[int] = mapped_column(
         ForeignKey("github_events.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    round_number: Mapped[int] = mapped_column()  # 1, 2, 3
-    round_type: Mapped[str] = mapped_column(String(32))  # rule_check / semantic_review / synthesis
+    round_number: Mapped[int] = mapped_column()  # file index (0=rule_check, 1..N=file)
+    round_type: Mapped[str] = mapped_column(String(32))  # rule_check / functionality_best_practices / security_performance_health
+    file_path: Mapped[str | None] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/success/failed/skipped
     input_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)  # summary of inputs fed to this round
     output_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)  # structured output from this round
@@ -141,7 +139,7 @@ class Notification(Base):
     event_id: Mapped[int] = mapped_column(
         ForeignKey("github_events.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    channel: Mapped[str] = mapped_column(String(32), default="wecom")  # wecom / feishu
+    channel: Mapped[str] = mapped_column(String(32), default="generic")  # generic
     trigger_reason: Mapped[str] = mapped_column(String(64))  # "critical", "high", "medium_low_score"
     risk_level: Mapped[str | None] = mapped_column(String(16))
     message_content: Mapped[str | None] = mapped_column(Text)  # rendered markdown / card JSON

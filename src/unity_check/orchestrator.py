@@ -1,14 +1,12 @@
-"""Multi-round evaluation orchestrator.
+"""Per-file evaluation orchestrator.
 
-Orchestrates three evaluation rounds for a single GitHub event:
-
-1. Round 1 (rule_check)   — summarises ``RuleResult`` rows from Roslyn.
-2. Round 2 (semantic_review) — LLM semantic deep-dive on the diff + R1 results.
-3. Round 3 (synthesis)       — LLM final assessment: score, risk, recommendation.
-
-Each round writes an independent ``EvaluationRound`` row so the pipeline
-can be inspected and debugged step-by-step.  Round 2 failures are tolerated;
-Round 3 always runs, with or without R2 findings.
+For each .cs file in the diff:
+1. Aggregate Roslyn RuleResult → 1 rule_check EvaluationRound (round_number=0)
+2. For each file (round_number = file_index, 1..N):
+   a. Evaluate dimension A: functionality_best_practices → EvaluationRound
+   b. Evaluate dimension B: security_performance_health → EvaluationRound
+3. Programmatically aggregate all dimension results → update GithubEvent
+4. Trigger notification
 """
 
 from __future__ import annotations
@@ -20,11 +18,15 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from unity_check.llm import semantic_review, synthesis_summary
+from unity_check.llm import evaluate_file_dimension
 from unity_check.models import EvaluationRound, GithubEvent, RuleResult
 from unity_check.notification_service import build_and_persist_notifications
+from unity_check.rule_service import extract_cs_files_from_diff
 
 logger = logging.getLogger(__name__)
+
+DIMENSIONS = ["functionality_best_practices", "security_performance_health"]
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -32,32 +34,33 @@ logger = logging.getLogger(__name__)
 
 
 def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
-    """Execute the full three-round evaluation pipeline for *event*.
+    """Execute per-file, per-dimension evaluation for *event*.
 
     Side-effects
     ------------
-    * Inserts 3 ``EvaluationRound`` rows (one per round).
+    * Inserts ``1 + N*2`` ``EvaluationRound`` rows (1 rule_check + N files × 2 dimensions).
     * Mutates *event* in-place: ``overall_score``, ``final_risk_level``,
-      ``recommendation``, ``executive_summary``, ``risk_level``,
-      ``evaluation_summary``, ``status``.
+      ``recommendation``, ``executive_summary``, ``dimension_a_score``,
+      ``dimension_b_score``, ``dimension_a_summary``, ``dimension_b_summary``,
+      ``status``.
 
     Returns
     -------
     dict
-        Summary of the pipeline run suitable for logging / task response.
+        Summary of the pipeline run.
     """
     event_id = int(event.id)
     diff = (event.diff_content or "").strip()
     event_summary = _event_context(event)
 
-    # ---- Round 1: rule check summary ---------------------------------------
+    # ---- Step 1: Rule results summary (programmatic, no LLM) -----------------
     r1_start = datetime.now(timezone.utc)
     r1_summary = _build_rule_results_summary(event_id, db)
     r1_duration = int((datetime.now(timezone.utc) - r1_start).total_seconds() * 1000)
     _persist_evaluation_round(
         db,
         event_id=event_id,
-        round_number=1,
+        round_number=0,
         round_type="rule_check",
         status="success",
         input_summary={"diff_size": len(diff), "event_summary": event_summary},
@@ -65,187 +68,194 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
         tokens_used=0,
         duration_ms=r1_duration,
     )
-    logger.info("R1 rule_check done for event_id=%s: %d violations", event_id, r1_summary.get("total", 0))
+    logger.info("Rule check done for event_id=%s: %d violations", event_id, r1_summary.get("total", 0))
 
-    # ---- Round 2: semantic review ------------------------------------------
-    r2_findings: list[dict[str, Any]] | None = None
-    r2_success = False
-    r2_error: str | None = None
+    # ---- Step 2: Extract .cs files from diff --------------------------------
+    cs_files = extract_cs_files_from_diff(diff) if diff else []
+    if not cs_files:
+        logger.info("No .cs files in diff for event_id=%s — using safe defaults", event_id)
+        _set_safe_defaults(event, reason="no .cs files in diff")
+        build_and_persist_notifications(event, db)
+        return {
+            "status": event.status,
+            "files_evaluated": 0,
+            "overall_score": event.overall_score,
+            "risk_level": event.final_risk_level,
+            "recommendation": event.recommendation,
+        }
 
-    r2_start = datetime.now(timezone.utc)
-    try:
-        r2_result = semantic_review(
-            diff_content=diff,
-            rule_results_summary=r1_summary,
-            event_summary=event_summary,
-        )
-        r2_duration = int((datetime.now(timezone.utc) - r2_start).total_seconds() * 1000)
-
-        if r2_result.get("error"):
-            r2_error = r2_result["error"]
-            _persist_evaluation_round(
-                db,
-                event_id=event_id,
-                round_number=2,
-                round_type="semantic_review",
-                status="failed",
-                input_summary=_build_r2_input(diff, r1_summary, event_summary),
-                output_data=None,
-                model_name=r2_result.get("model_name", ""),
-                tokens_used=r2_result.get("tokens_used", 0),
-                duration_ms=r2_duration,
-                error_message=r2_error,
-            )
-        else:
-            r2_findings = r2_result.get("findings", [])
-            r2_success = True
-            _persist_evaluation_round(
-                db,
-                event_id=event_id,
-                round_number=2,
-                round_type="semantic_review",
-                status="success",
-                input_summary=_build_r2_input(diff, r1_summary, event_summary),
-                output_data={"findings": r2_findings},
-                model_name=r2_result.get("model_name", ""),
-                tokens_used=r2_result.get("tokens_used", 0),
-                duration_ms=r2_duration,
-            )
-        logger.info(
-            "R2 semantic_review done for event_id=%s: success=%s findings=%d",
-            event_id, r2_success, len(r2_findings or []),
-        )
-    except Exception as exc:
-        r2_duration = int((datetime.now(timezone.utc) - r2_start).total_seconds() * 1000)
-        r2_error = str(exc)
-        _persist_evaluation_round(
-            db,
-            event_id=event_id,
-            round_number=2,
-            round_type="semantic_review",
-            status="failed",
-            input_summary=_build_r2_input(diff, r1_summary, event_summary),
-            output_data=None,
-            tokens_used=0,
-            duration_ms=r2_duration,
-            error_message=r2_error,
-        )
-        logger.exception("R2 semantic_review exception for event_id=%s", event_id)
-
-    # ---- Round 3: synthesis -------------------------------------------------
-    r3_start = datetime.now(timezone.utc)
-    try:
-        r3_result = synthesis_summary(
-            diff_content=diff,
-            rule_results_summary=r1_summary,
-            r2_findings=r2_findings,
-            event_summary=event_summary,
-        )
-        r3_duration = int((datetime.now(timezone.utc) - r3_start).total_seconds() * 1000)
-
-        if r3_result.get("error"):
-            _persist_evaluation_round(
-                db,
-                event_id=event_id,
-                round_number=3,
-                round_type="synthesis",
-                status="failed",
-                input_summary=_build_r3_input(diff, r1_summary, r2_findings, r2_error, event_summary),
-                output_data=None,
-                model_name=r3_result.get("model_name", ""),
-                tokens_used=r3_result.get("tokens_used", 0),
-                duration_ms=r3_duration,
-                error_message=r3_result["error"],
-            )
-            # Fill safe defaults on the event.
-            event.overall_score = None
-            event.final_risk_level = "unknown"
-            event.recommendation = "needs_review"
-            event.executive_summary = f"Round 3 failed: {r3_result['error']}"
-            event.risk_level = "unknown"
-            event.evaluation_summary = event.executive_summary
-            event.status = "failed"
-        else:
-            _persist_evaluation_round(
-                db,
-                event_id=event_id,
-                round_number=3,
-                round_type="synthesis",
-                status="success",
-                input_summary=_build_r3_input(diff, r1_summary, r2_findings, r2_error, event_summary),
-                output_data={
-                    "overall_score": r3_result["overall_score"],
-                    "risk_level": r3_result["risk_level"],
-                    "executive_summary": r3_result["executive_summary"],
-                    "top_issues": r3_result.get("top_issues", []),
-                    "recommendation": r3_result["recommendation"],
-                    "action_items": r3_result.get("action_items", []),
-                },
-                score=r3_result["overall_score"],
-                model_name=r3_result.get("model_name", ""),
-                tokens_used=r3_result.get("tokens_used", 0),
-                duration_ms=r3_duration,
-            )
-            # Update event with final assessment.
-            event.overall_score = r3_result["overall_score"]
-            event.final_risk_level = r3_result["risk_level"]
-            event.recommendation = r3_result["recommendation"]
-            event.executive_summary = r3_result["executive_summary"]
-            # Backward-compatible snapshot.
-            event.risk_level = r3_result["risk_level"]
-            event.evaluation_summary = r3_result["executive_summary"]
-            event.status = "success"
-
-        logger.info(
-            "R3 synthesis done for event_id=%s: score=%s risk=%s recommendation=%s",
-            event_id,
-            r3_result.get("overall_score"),
-            r3_result.get("risk_level"),
-            r3_result.get("recommendation"),
-        )
-    except Exception as exc:
-        r3_duration = int((datetime.now(timezone.utc) - r3_start).total_seconds() * 1000)
-        _persist_evaluation_round(
-            db,
-            event_id=event_id,
-            round_number=3,
-            round_type="synthesis",
-            status="failed",
-            input_summary=_build_r3_input(diff, r1_summary, r2_findings, r2_error, event_summary),
-            output_data=None,
-            tokens_used=0,
-            duration_ms=r3_duration,
-            error_message=str(exc),
-        )
-        event.overall_score = None
-        event.final_risk_level = "unknown"
-        event.recommendation = "needs_review"
-        event.executive_summary = f"Round 3 exception: {exc}"
-        event.risk_level = "unknown"
-        event.evaluation_summary = event.executive_summary
-        event.status = "failed"
-        logger.exception("R3 synthesis exception for event_id=%s", event_id)
-
-    # ---- Post-pipeline: notification -------------------------------------
-    build_and_persist_notifications(event, db)
-
-    # Build result summary.
+    # ---- Step 3: Per-file, per-dimension LLM evaluation ---------------------
+    all_dim_scores: dict[str, list[float]] = {"functionality_best_practices": [], "security_performance_health": []}
+    all_dim_summaries: dict[str, list[str]] = {"functionality_best_practices": [], "security_performance_health": []}
+    all_findings: list[dict[str, Any]] = []
+    total_files_evaluated = 0
     rounds_completed = 0
-    if r1_summary:
-        rounds_completed += 1
-    if r2_success:
-        rounds_completed += 1
-    if event.status == "success":
-        rounds_completed = 3
+
+    per_file_rules = r1_summary.get("by_file", {})
+
+    for file_idx, file_path in enumerate(cs_files, start=1):
+        # Extract file-specific diff
+        file_diff = _extract_file_diff(diff, file_path)
+        # Get file-specific rule results
+        file_rules = per_file_rules.get(file_path, [])
+
+        for dim in DIMENSIONS:
+            start = datetime.now(timezone.utc)
+            try:
+                result = evaluate_file_dimension(
+                    file_path=file_path,
+                    file_diff=file_diff,
+                    file_rule_results=file_rules,
+                    event_summary=event_summary,
+                    dimension=dim,
+                )
+                dur = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+
+                if result.get("error"):
+                    _persist_evaluation_round(
+                        db, event_id=event_id, round_number=file_idx,
+                        round_type=dim, file_path=file_path, status="failed",
+                        input_summary={"file_path": file_path, "dimension": dim},
+                        output_data=None, model_name=result.get("model_name", ""),
+                        tokens_used=result.get("tokens_used", 0), duration_ms=dur,
+                        error_message=result["error"],
+                    )
+                    all_dim_scores[dim].append(0.0)
+                else:
+                    score = result.get("score", 0)
+                    summary = result.get("summary", "")
+                    findings = result.get("findings", [])
+
+                    _persist_evaluation_round(
+                        db, event_id=event_id, round_number=file_idx,
+                        round_type=dim, file_path=file_path, status="success",
+                        input_summary={"file_path": file_path, "dimension": dim},
+                        output_data={"score": score, "summary": summary, "findings": findings},
+                        score=score,
+                        model_name=result.get("model_name", ""),
+                        tokens_used=result.get("tokens_used", 0), duration_ms=dur,
+                    )
+                    all_dim_scores[dim].append(score)
+                    all_dim_summaries[dim].append(summary)
+                    all_findings.extend(findings)
+                    rounds_completed += 1
+
+            except Exception as exc:
+                dur = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+                _persist_evaluation_round(
+                    db, event_id=event_id, round_number=file_idx,
+                    round_type=dim, file_path=file_path, status="failed",
+                    input_summary={"file_path": file_path, "dimension": dim},
+                    output_data=None, tokens_used=0, duration_ms=dur,
+                    error_message=str(exc),
+                )
+                logger.exception("Dimension %s failed for %s event_id=%s", dim, file_path, event_id)
+
+        total_files_evaluated += 1
+
+    # ---- Step 4: Programmatic aggregation -----------------------------------
+    _aggregate_and_update_event(event, all_dim_scores, all_dim_summaries, all_findings, cs_files)
+
+    # ---- Step 5: Notification -----------------------------------------------
+    build_and_persist_notifications(event, db)
 
     return {
         "status": event.status,
+        "files_evaluated": total_files_evaluated,
         "rounds_completed": rounds_completed,
         "overall_score": event.overall_score,
         "risk_level": event.final_risk_level,
         "recommendation": event.recommendation,
-        "executive_summary": event.executive_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Aggregation helpers
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_and_update_event(
+    event: GithubEvent,
+    dim_scores: dict[str, list[float]],
+    dim_summaries: dict[str, list[str]],
+    all_findings: list[dict[str, Any]],
+    cs_files: list[str],
+) -> None:
+    """Compute aggregated scores/risk and write to event."""
+    dim_a = dim_scores["functionality_best_practices"]
+    dim_b = dim_scores["security_performance_health"]
+
+    # Dimension scores: average per file
+    dim_a_avg = round(sum(dim_a) / len(dim_a), 1) if dim_a else None
+    dim_b_avg = round(sum(dim_b) / len(dim_b), 1) if dim_b else None
+
+    # Overall score: average of all dimension scores (weighted equally across files)
+    all_scores = dim_a + dim_b
+    overall_score = round(sum(all_scores) / len(all_scores), 1) if all_scores else None
+
+    # Risk level: highest severity across all findings
+    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    max_sev_score = 0
+    max_sev = "low"
+    for f in all_findings:
+        sev = str(f.get("severity", "low")).lower()
+        s = severity_order.get(sev, 0)
+        if s > max_sev_score:
+            max_sev_score = s
+            max_sev = sev
+
+    # Recommendation
+    if overall_score is not None:
+        if max_sev == "critical" or overall_score < 50:
+            recommendation = "blocked"
+        elif overall_score >= 80 and max_sev in ("low", "medium"):
+            recommendation = "merge_ready"
+        else:
+            recommendation = "needs_review"
+    else:
+        recommendation = "needs_review"
+
+    # Top issues (max 10, ordered by severity)
+    top_issues = sorted(all_findings, key=lambda f: severity_order.get(str(f.get("severity", "low")).lower(), 0), reverse=True)[:10]
+
+    # Executive summary
+    dim_a_sum = f"功能/最佳实践: {dim_a_avg}/100" if dim_a_avg is not None else "功能/最佳实践: N/A"
+    dim_b_sum = f"安全/性能/健康度: {dim_b_avg}/100" if dim_b_avg is not None else "安全/性能/健康度: N/A"
+    top_titles = "; ".join(f["title"] for f in top_issues[:3]) if top_issues else "无严重问题"
+
+    executive_summary = (
+        f"评估了 {len(cs_files)} 个文件。综合评分: {overall_score}/100。"
+        f"风险等级: {max_sev}。{dim_a_sum}。{dim_b_sum}。"
+        f"主要问题: {top_titles}"
+    )
+
+    event.overall_score = overall_score
+    event.final_risk_level = max_sev
+    event.recommendation = recommendation
+    event.executive_summary = executive_summary
+    event.dimension_a_score = dim_a_avg
+    event.dimension_b_score = dim_b_avg
+    event.dimension_a_summary = "; ".join(dim_summaries["functionality_best_practices"][:3]) if dim_summaries["functionality_best_practices"] else None
+    event.dimension_b_summary = "; ".join(dim_summaries["security_performance_health"][:3]) if dim_summaries["security_performance_health"] else None
+    event.status = "success"
+
+    logger.info(
+        "Aggregation done for event_id=%s: score=%s risk=%s recommendation=%s",
+        event.id, overall_score, max_sev, recommendation,
+    )
+
+
+def _set_safe_defaults(event: GithubEvent, reason: str) -> None:
+    """Set safe fallback values when evaluation cannot proceed."""
+    event.overall_score = None
+    event.final_risk_level = "unknown"
+    event.recommendation = "needs_review"
+    event.executive_summary = f"跳过评估: {reason}"
+    event.dimension_a_score = None
+    event.dimension_b_score = None
+    event.dimension_a_summary = None
+    event.dimension_b_summary = None
+    event.status = "success"
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +279,10 @@ def _event_context(event: GithubEvent) -> str:
 
 
 def _build_rule_results_summary(event_id: int, db: Session) -> dict[str, Any]:
-    """Aggregate ``RuleResult`` rows for *event_id* into a summary dict."""
+    """Aggregate ``RuleResult`` rows for *event_id* into a summary dict.
+
+    Includes per-file breakdown for filtering rule results to individual files.
+    """
     rows = db.scalars(
         select(RuleResult).where(RuleResult.event_id == event_id)
     ).all()
@@ -281,12 +294,14 @@ def _build_rule_results_summary(event_id: int, db: Session) -> dict[str, Any]:
             "by_category": {},
             "top_rules": [],
             "top_files": [],
+            "by_file": {},
         }
 
     severity_counts: dict[str, int] = {}
     category_counts: dict[str, int] = {}
     rule_counts: dict[str, int] = {}
     file_counts: dict[str, int] = {}
+    by_file: dict[str, list[dict[str, Any]]] = {}
 
     for r in rows:
         sev = r.severity.lower()
@@ -297,6 +312,18 @@ def _build_rule_results_summary(event_id: int, db: Session) -> dict[str, Any]:
         rule_counts[key] = rule_counts.get(key, 0) + 1
         file_counts[r.file_path] = file_counts.get(r.file_path, 0) + 1
 
+        # Per-file detail for LLM context
+        if r.file_path not in by_file:
+            by_file[r.file_path] = []
+        by_file[r.file_path].append({
+            "rule_id": r.rule_id,
+            "rule_name": r.rule_name,
+            "severity": r.severity,
+            "category": r.category,
+            "message": r.message,
+            "line_number": r.line_number,
+        })
+
     top_rules = sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:10]
     top_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
@@ -306,7 +333,40 @@ def _build_rule_results_summary(event_id: int, db: Session) -> dict[str, Any]:
         "by_category": category_counts,
         "top_rules": [{"rule": k, "count": v} for k, v in top_rules],
         "top_files": [{"file": k, "count": v} for k, v in top_files],
+        "by_file": by_file,
     }
+
+
+def _extract_file_diff(full_diff: str, file_path: str) -> str:
+    """Extract diff blocks relevant to *file_path* from a unified diff.
+
+    Parses ``diff --git a/<path> b/<path>`` headers and keeps blocks
+    matching the given file path.
+    """
+    if not full_diff:
+        return ""
+
+    lines = full_diff.split("\n")
+    result: list[str] = []
+    in_block = False
+    current_path = ""
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            # Extract b/ path
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                b_path = parts[3]
+                if b_path.startswith("b/"):
+                    b_path = b_path[2:]
+                current_path = b_path
+                in_block = (current_path == file_path)
+            else:
+                in_block = False
+        if in_block:
+            result.append(line)
+
+    return "\n".join(result)
 
 
 def _persist_evaluation_round(
@@ -316,6 +376,7 @@ def _persist_evaluation_round(
     round_number: int,
     round_type: str,
     status: str,
+    file_path: str | None = None,
     input_summary: dict[str, Any] | None = None,
     output_data: dict[str, Any] | None = None,
     score: float | None = None,
@@ -330,6 +391,7 @@ def _persist_evaluation_round(
         event_id=event_id,
         round_number=round_number,
         round_type=round_type,
+        file_path=file_path,
         status=status,
         input_summary=input_summary,
         output_data=output_data,
@@ -344,30 +406,3 @@ def _persist_evaluation_round(
     db.add(er)
     db.flush()
     return er
-
-
-def _build_r2_input(
-    diff: str, rule_summary: dict[str, Any], event_summary: str
-) -> dict[str, Any]:
-    return {
-        "diff_size": len(diff),
-        "rule_summary": rule_summary,
-        "event_summary": event_summary,
-    }
-
-
-def _build_r3_input(
-    diff: str,
-    rule_summary: dict[str, Any],
-    r2_findings: list[dict[str, Any]] | None,
-    r2_error: str | None,
-    event_summary: str,
-) -> dict[str, Any]:
-    return {
-        "diff_size": len(diff),
-        "rule_summary": rule_summary,
-        "r2_findings_count": len(r2_findings) if r2_findings else 0,
-        "r2_success": r2_findings is not None,
-        "r2_error": r2_error,
-        "event_summary": event_summary,
-    }

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getEventDetail, getEventRules, getEventEvaluations, getEventAssessment } from '../api/index.js'
 
@@ -9,7 +9,7 @@ const event = ref(null)
 const rules = ref([])
 const evaluations = ref([])
 const assessment = ref(null)
-const activeTab = ref('assessment')
+const activeTab = ref('dim-a')
 
 async function fetchData() {
   try {
@@ -21,9 +21,10 @@ async function fetchData() {
       getEventAssessment(id),
     ])
     event.value = evtRes.data
-    rules.value = rulesRes.data || []
+    // Rules & assessment now embedded via ?include=rules / ?include=assessment
+    rules.value = rulesRes.data?.rules || []
     evaluations.value = evalRes.data || []
-    assessment.value = assessRes.data
+    assessment.value = assessRes.data?.assessment || assessRes.data
   } catch (e) {
     ElMessage.error('加载事件详情失败')
   } finally {
@@ -31,12 +32,39 @@ async function fetchData() {
   }
 }
 
+// Filter evaluation rounds by type
+const ruleCheckRound = computed(() =>
+  evaluations.value.find(r => r.round_type === 'rule_check')
+)
+const dimARounds = computed(() =>
+  evaluations.value.filter(r => r.round_type === 'functionality_best_practices')
+)
+const dimBRounds = computed(() =>
+  evaluations.value.filter(r => r.round_type === 'security_performance_health')
+)
+
+// Collect all findings from dimension rounds
+const dimAFindings = computed(() => {
+  const f = []
+  for (const r of dimARounds.value) {
+    for (const finding of (r.output_data?.findings || [])) {
+      f.push({ ...finding, file_path: r.file_path, round_id: r.id })
+    }
+  }
+  return f
+})
+const dimBFindings = computed(() => {
+  const f = []
+  for (const r of dimBRounds.value) {
+    for (const finding of (r.output_data?.findings || [])) {
+      f.push({ ...finding, file_path: r.file_path, round_id: r.id })
+    }
+  }
+  return f
+})
+
 function getRiskType(level) {
   return level === 'critical' || level === 'high' ? 'danger' : level === 'medium' ? 'warning' : 'success'
-}
-
-function getEvalRound(roundNum) {
-  return evaluations.value.find(r => r.round_number === roundNum) || null
 }
 
 function formatMs(ms) {
@@ -93,16 +121,18 @@ onMounted(fetchData)
       </div>
       <div class="score-meta">
         <div><span class="meta-label">建议：</span><span class="rec-text">{{ (assessment.recommendation || '').replace('_', ' ') }}</span></div>
+        <div><span class="meta-label">维度A(功能/最佳实践)：</span>{{ assessment.dimension_a_score?.toFixed(1) ?? '-' }}</div>
+        <div><span class="meta-label">维度B(安全/性能/健康度)：</span>{{ assessment.dimension_b_score?.toFixed(1) ?? '-' }}</div>
         <div><span class="meta-label">总 Token：</span>{{ assessment.total_tokens_used?.toLocaleString() ?? '-' }}</div>
         <div><span class="meta-label">总耗时：</span>{{ formatMs(assessment.total_duration_ms) }}</div>
       </div>
     </div>
 
-    <!-- Tabs: Assessment / R1 / R2 / R3 / Diff -->
+    <!-- Tabs -->
     <div class="dashboard-card" style="margin-top: 16px;">
       <el-tabs v-model="activeTab" type="border-card">
-        <!-- Round 1 -->
-        <el-tab-pane label="Round 1 · 规则检测" name="round1">
+        <!-- Rules Tab (Roslyn) -->
+        <el-tab-pane label="规则检测" name="rules">
           <div class="round-header">
             <span class="round-badge">共 {{ rules.length }} 条违规</span>
           </div>
@@ -126,79 +156,75 @@ onMounted(fetchData)
           </el-table>
         </el-tab-pane>
 
-        <!-- Round 2 -->
-        <el-tab-pane label="Round 2 · 语义评估" name="round2">
+        <!-- Dimension A Tab -->
+        <el-tab-pane label="维度A · 功能与最佳实践" name="dim-a">
           <div class="round-header">
-            <span class="round-badge" :class="getEvalRound(2)?.status === 'success' ? 'badge-ok' : 'badge-fail'">
-              {{ getEvalRound(2)?.status === 'success' ? '成功' : '失败' }}
-            </span>
-            <template v-if="getEvalRound(2)">
-              <span class="round-info">Token: {{ getEvalRound(2).tokens_used }} | 耗时: {{ formatMs(getEvalRound(2).duration_ms) }}</span>
-            </template>
-          </div>
-          <div v-if="getEvalRound(2)?.status === 'failed'" class="error-block">
-            <el-alert :title="getEvalRound(2)?.error_message" type="error" show-icon :closable="false" />
-          </div>
-          <el-empty v-else-if="!getEvalRound(2)" description="未执行" />
-          <div v-else class="findings-list">
-            <div v-for="(f, i) in (getEvalRound(2)?.output_data?.findings || [])" :key="i" class="finding-item">
-              <div class="finding-title">
-                <el-tag :type="f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warning' : 'info'" size="small" effect="dark">
-                  {{ f.severity || '?' }}
-                </el-tag>
-                <span class="finding-name">{{ f.title }}</span>
-                <el-tag size="small" type="info">{{ f.category }}</el-tag>
-              </div>
-              <div class="finding-desc">{{ f.description }}</div>
-              <div v-if="f.suggestion" class="finding-suggestion">💡 {{ f.suggestion }}</div>
-              <div v-if="f.file" class="finding-file">📄 {{ f.file }}{{ f.line_hint ? ` : ${f.line_hint}` : '' }}</div>
-            </div>
-            <el-empty v-if="!getEvalRound(2)?.output_data?.findings?.length" description="未发现语义问题" />
-          </div>
-        </el-tab-pane>
-
-        <!-- Round 3 -->
-        <el-tab-pane label="Round 3 · 综合评估" name="round3">
-          <div class="round-header">
-            <span class="round-badge" :class="getEvalRound(3)?.status === 'success' ? 'badge-ok' : 'badge-fail'">
-              {{ getEvalRound(3)?.status === 'success' ? '成功' : '失败' }}
+            <span class="round-badge badge-ok">已评估 {{ dimARounds.length }} 文件</span>
+            <span class="round-info" v-if="dimARounds.length">
+              均分: {{ assessment?.dimension_a_score?.toFixed(1) ?? '-' }} |
+              Token: {{ dimARounds.reduce((s,r) => s + (r.tokens_used || 0), 0) }}
             </span>
           </div>
-          <div v-if="getEvalRound(3)?.status === 'failed'" class="error-block">
-            <el-alert :title="getEvalRound(3)?.error_message" type="error" show-icon :closable="false" />
-          </div>
-          <div v-else-if="getEvalRound(3)" class="assessment-detail">
-            <div class="summary-block">
-              <h4>执行摘要</h4>
-              <p>{{ event?.executive_summary || '-' }}</p>
+          <div v-for="r in dimARounds" :key="r.id" class="file-eval-block">
+            <h4 class="file-eval-title">📄 {{ r.file_path }} — 评分: {{ r.score?.toFixed(0) ?? 'N/A' }}</h4>
+            <p class="file-eval-summary">{{ r.output_data?.summary || '无摘要' }}</p>
+            <div v-if="r.status === 'failed'" class="error-block">
+              <el-alert :title="r.error_message" type="error" show-icon :closable="false" />
             </div>
-            <div class="issues-block">
-              <h4>关键问题</h4>
-              <div v-for="(iss, i) in (getEvalRound(3)?.output_data?.top_issues || [])" :key="i" class="issue-line">
-                <el-tag :type="iss.severity === 'critical' || iss.severity === 'high' ? 'danger' : 'warning'" size="small" effect="dark">
-                  {{ iss.severity }}
-                </el-tag>
-                <span>{{ iss.title }}</span>
-                <el-tag size="small" type="info">来源: {{ iss.source }}</el-tag>
+            <div v-else class="findings-list">
+              <div v-for="(f, i) in (r.output_data?.findings || [])" :key="i" class="finding-item">
+                <div class="finding-title">
+                  <el-tag :type="f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warning' : 'info'" size="small" effect="dark">
+                    {{ f.severity || '?' }}
+                  </el-tag>
+                  <span class="finding-name">{{ f.title }}</span>
+                  <el-tag size="small" type="info">{{ f.category }}</el-tag>
+                </div>
+                <div class="finding-desc">{{ f.description }}</div>
+                <div v-if="f.suggestion" class="finding-suggestion">💡 {{ f.suggestion }}</div>
+                <div v-if="f.line_hint" class="finding-file">📍 {{ f.line_hint }}</div>
               </div>
-            </div>
-            <div class="actions-block">
-              <h4>行动项</h4>
-              <el-timeline>
-                <el-timeline-item
-                  v-for="(act, i) in (getEvalRound(3)?.output_data?.action_items || [])"
-                  :key="i"
-                  :color="act.priority === 'high' ? '#EF4444' : act.priority === 'medium' ? '#F59E0B' : '#3B82F6'"
-                >
-                  {{ act.action }}
-                  <el-tag size="small">{{ act.priority }}</el-tag>
-                </el-timeline-item>
-              </el-timeline>
+              <el-empty v-if="!r.output_data?.findings?.length" description="此文件未发现问题" />
             </div>
           </div>
+          <el-empty v-if="!dimARounds.length" description="未执行维度A评估" />
         </el-tab-pane>
 
-        <!-- Diff -->
+        <!-- Dimension B Tab -->
+        <el-tab-pane label="维度B · 安全与性能" name="dim-b">
+          <div class="round-header">
+            <span class="round-badge badge-ok">已评估 {{ dimBRounds.length }} 文件</span>
+            <span class="round-info" v-if="dimBRounds.length">
+              均分: {{ assessment?.dimension_b_score?.toFixed(1) ?? '-' }} |
+              Token: {{ dimBRounds.reduce((s,r) => s + (r.tokens_used || 0), 0) }}
+            </span>
+          </div>
+          <div v-for="r in dimBRounds" :key="r.id" class="file-eval-block">
+            <h4 class="file-eval-title">📄 {{ r.file_path }} — 评分: {{ r.score?.toFixed(0) ?? 'N/A' }}</h4>
+            <p class="file-eval-summary">{{ r.output_data?.summary || '无摘要' }}</p>
+            <div v-if="r.status === 'failed'" class="error-block">
+              <el-alert :title="r.error_message" type="error" show-icon :closable="false" />
+            </div>
+            <div v-else class="findings-list">
+              <div v-for="(f, i) in (r.output_data?.findings || [])" :key="i" class="finding-item">
+                <div class="finding-title">
+                  <el-tag :type="f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warning' : 'info'" size="small" effect="dark">
+                    {{ f.severity || '?' }}
+                  </el-tag>
+                  <span class="finding-name">{{ f.title }}</span>
+                  <el-tag size="small" type="info">{{ f.category }}</el-tag>
+                </div>
+                <div class="finding-desc">{{ f.description }}</div>
+                <div v-if="f.suggestion" class="finding-suggestion">💡 {{ f.suggestion }}</div>
+                <div v-if="f.line_hint" class="finding-file">📍 {{ f.line_hint }}</div>
+              </div>
+              <el-empty v-if="!r.output_data?.findings?.length" description="此文件未发现问题" />
+            </div>
+          </div>
+          <el-empty v-if="!dimBRounds.length" description="未执行维度B评估" />
+        </el-tab-pane>
+
+        <!-- Diff Tab -->
         <el-tab-pane label="Diff 视图" name="diff">
           <div class="diff-view" v-if="event?.diff_content">
             <pre>{{ event.diff_content }}</pre>
@@ -206,14 +232,26 @@ onMounted(fetchData)
           <el-empty v-else description="无 Diff 内容" />
         </el-tab-pane>
 
-        <!-- Summary Assessment -->
+        <!-- Summary Assessment Tab -->
         <el-tab-pane label="评估摘要" name="assessment">
           <div class="score-display">
             <div class="big-score">{{ assessment?.overall_score?.toFixed(0) ?? '-' }}</div>
             <div class="big-score-label">/100</div>
           </div>
+          <div class="dim-scores" style="display:flex;gap:24px;justify-content:center;margin:8px 0;">
+            <div>维度A (功能/最佳实践): <strong>{{ assessment?.dimension_a_score?.toFixed(1) ?? '-' }}</strong></div>
+            <div>维度B (安全/性能/健康度): <strong>{{ assessment?.dimension_b_score?.toFixed(1) ?? '-' }}</strong></div>
+          </div>
           <div class="summary-block" style="margin-top: 16px;">
             <p>{{ event?.executive_summary || '暂无评估摘要' }}</p>
+          </div>
+          <div v-if="event?.dimension_a_summary" class="summary-block" style="margin-top: 12px;">
+            <h4>维度A 摘要</h4>
+            <p>{{ event.dimension_a_summary }}</p>
+          </div>
+          <div v-if="event?.dimension_b_summary" class="summary-block" style="margin-top: 12px;">
+            <h4>维度B 摘要</h4>
+            <p>{{ event.dimension_b_summary }}</p>
           </div>
         </el-tab-pane>
       </el-tabs>
@@ -231,53 +269,57 @@ onMounted(fetchData)
 
 .meta-card {
   padding: 16px 24px;
+  margin-bottom: 16px;
 }
 
 .score-bar {
   display: flex;
   align-items: center;
   gap: 32px;
-  margin-top: 16px;
-  padding: 20px 32px;
-  background: var(--color-bg-card);
-  border: 1px solid var(--color-border);
-  border-radius: 12px;
+  padding: 24px;
+  background: var(--el-fill-color-light);
+  border-radius: 8px;
+  margin-bottom: 16px;
 }
 
 .score-circle {
-  text-align: center;
-  min-width: 100px;
+  width: 100px;
+  height: 100px;
+  border-radius: 50%;
+  background: var(--el-color-primary-light-9);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 3px solid var(--el-color-primary);
 }
 
 .score-number {
-  font-family: var(--font-heading);
-  font-size: 48px;
+  font-size: 28px;
   font-weight: 700;
-  color: var(--color-primary);
-  line-height: 1;
+  color: var(--el-color-primary);
+  line-height: 1.2;
 }
 
 .score-label {
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  margin-top: 4px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 
 .score-meta {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  color: var(--color-text-secondary);
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .meta-label {
-  color: var(--color-text);
+  font-weight: 600;
+  color: var(--el-text-color-regular);
 }
 
 .rec-text {
   text-transform: capitalize;
-  color: var(--color-primary);
 }
 
 .round-header {
@@ -285,110 +327,147 @@ onMounted(fetchData)
   align-items: center;
   gap: 12px;
   margin-bottom: 12px;
+  flex-wrap: wrap;
 }
 
 .round-badge {
-  font-family: var(--font-heading);
-  font-size: 12px;
+  background: var(--el-color-info-light-5);
+  color: var(--el-color-info);
   padding: 2px 10px;
-  border-radius: 4px;
-  background: rgba(59,130,246,0.15);
-  color: var(--color-primary);
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 600;
 }
 
-.badge-ok { color: var(--color-success); background: rgba(34,197,94,0.15); }
-.badge-fail { color: var(--color-critical); background: rgba(239,68,68,0.15); }
+.round-badge.badge-ok {
+  background: var(--el-color-success-light-5);
+  color: var(--el-color-success);
+}
+
+.round-badge.badge-fail {
+  background: var(--el-color-danger-light-5);
+  color: var(--el-color-danger);
+}
 
 .round-info {
-  color: var(--color-text-secondary);
-  font-size: 12px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
 }
 
-.file-path {
-  font-family: var(--font-heading);
-  font-size: 12px;
-  color: var(--color-primary);
+.file-eval-block {
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+
+.file-eval-title {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.file-eval-summary {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+
+.error-block {
+  margin: 8px 0;
+}
+
+.findings-list {
+  margin-top: 8px;
 }
 
 .finding-item {
-  padding: 12px 0;
-  border-bottom: 1px solid var(--color-border);
+  padding: 8px 0;
+  border-bottom: 1px solid var(--el-border-color-extra-light);
+}
+
+.finding-item:last-child {
+  border-bottom: none;
 }
 
 .finding-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
 }
 
 .finding-name {
-  font-weight: 500;
+  font-weight: 600;
+  font-size: 13px;
 }
 
 .finding-desc {
-  color: var(--color-text-secondary);
   font-size: 13px;
-  margin-bottom: 6px;
+  color: var(--el-text-color-regular);
+  margin: 4px 0;
 }
 
 .finding-suggestion {
-  color: var(--color-warning);
   font-size: 12px;
+  color: var(--el-color-success);
+  margin-top: 2px;
 }
 
 .finding-file {
-  color: var(--color-text-secondary);
   font-size: 12px;
-  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  margin-top: 2px;
 }
 
-.issue-line {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 0;
+.file-path {
+  font-size: 12px;
+  background: var(--el-fill-color);
+  padding: 1px 4px;
+  border-radius: 3px;
 }
 
-.issue-line span {
-  flex: 1;
+.diff-view {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 16px;
+  border-radius: 6px;
+  max-height: 500px;
+  overflow: auto;
 }
 
-.summary-block p {
-  color: var(--color-text-secondary);
-  line-height: 1.6;
-}
-
-.score-display {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  justify-content: center;
-  padding: 16px 0;
+.diff-view pre {
+  margin: 0;
+  font-size: 12px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .big-score {
-  font-family: var(--font-heading);
-  font-size: 64px;
-  font-weight: 700;
-  color: var(--color-primary);
-  line-height: 1;
+  font-size: 48px;
+  font-weight: 800;
+  color: var(--el-color-primary);
 }
 
 .big-score-label {
-  font-size: 24px;
-  color: var(--color-text-secondary);
+  font-size: 18px;
+  color: var(--el-text-color-secondary);
+  margin-top: 4px;
 }
 
-.error-block {
-  margin: 16px 0;
+.score-display {
+  text-align: center;
 }
 
-h4 {
-  font-family: var(--font-heading);
+.summary-block p {
+  line-height: 1.7;
+  color: var(--el-text-color-regular);
+}
+
+.summary-block h4 {
+  margin: 0 0 4px;
   font-size: 14px;
-  margin-bottom: 8px;
-  margin-top: 16px;
-  color: var(--color-text);
+  color: var(--el-text-color-secondary);
 }
 </style>

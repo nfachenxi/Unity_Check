@@ -1,4 +1,4 @@
-"""Tests for orchestrator.py — pipeline execution, persistence, degradation."""
+"""Tests for orchestrator.py — per-file, per-dimension evaluation pipeline."""
 
 import pytest
 
@@ -6,7 +6,9 @@ from unity_check.models import EvaluationRound, GithubEvent, RuleResult
 from unity_check.orchestrator import (
     _build_rule_results_summary,
     _event_context,
+    _extract_file_diff,
     _persist_evaluation_round,
+    _set_safe_defaults,
     run_evaluation_pipeline,
 )
 
@@ -41,6 +43,30 @@ class TestEventContext:
 
 
 # ---------------------------------------------------------------------------
+# _extract_file_diff
+# ---------------------------------------------------------------------------
+class TestExtractFileDiff:
+    def test_extracts_single_file(self):
+        diff = (
+            "diff --git a/A.cs b/A.cs\n"
+            "+line1\n"
+            "-line2\n"
+            "diff --git a/B.cs b/B.cs\n"
+            "+other\n"
+        )
+        result = _extract_file_diff(diff, "A.cs")
+        assert "+line1" in result
+        assert "+other" not in result
+
+    def test_empty_diff(self):
+        assert _extract_file_diff("", "A.cs") == ""
+
+    def test_no_match(self):
+        diff = "diff --git a/X.cs b/X.cs\n+stuff\n"
+        assert _extract_file_diff(diff, "A.cs") == ""
+
+
+# ---------------------------------------------------------------------------
 # _build_rule_results_summary
 # ---------------------------------------------------------------------------
 class TestBuildRuleResultsSummary:
@@ -60,6 +86,7 @@ class TestBuildRuleResultsSummary:
         assert summary["by_category"] == {}
         assert summary["top_rules"] == []
         assert summary["top_files"] == []
+        assert summary["by_file"] == {}
 
     def test_aggregates_rules(self, session):
         event = GithubEvent(
@@ -98,6 +125,11 @@ class TestBuildRuleResultsSummary:
         assert "naming" in summary["by_category"]
         assert len(summary["top_rules"]) == 2
         assert len(summary["top_files"]) >= 1
+        # Per-file breakdown
+        assert "A.cs" in summary["by_file"]
+        assert len(summary["by_file"]["A.cs"]) == 2
+        assert "B.cs" in summary["by_file"]
+        assert len(summary["by_file"]["B.cs"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +149,7 @@ class TestPersistEvaluationRound:
         er = _persist_evaluation_round(
             db=session,
             event_id=event.id,
-            round_number=1,
+            round_number=0,
             round_type="rule_check",
             status="success",
             input_summary={"k": "v"},
@@ -126,7 +158,7 @@ class TestPersistEvaluationRound:
             duration_ms=50,
         )
         assert er.id is not None
-        assert er.round_number == 1
+        assert er.round_number == 0
         assert er.status == "success"
 
         rows = session.query(EvaluationRound).filter_by(event_id=event.id).all()
@@ -134,18 +166,92 @@ class TestPersistEvaluationRound:
         assert rows[0].input_summary == {"k": "v"}
         assert rows[0].output_data == {"total": 5}
 
+    def test_writes_row_with_file_path(self, session):
+        event = GithubEvent(
+            delivery_id="orc-persist-fp",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+
+        er = _persist_evaluation_round(
+            db=session,
+            event_id=event.id,
+            round_number=1,
+            round_type="functionality_best_practices",
+            file_path="Assets/Scripts/Player.cs",
+            status="success",
+            score=85.0,
+        )
+        session.commit()
+        assert er.file_path == "Assets/Scripts/Player.cs"
+        assert er.score == 85.0
+
 
 # ---------------------------------------------------------------------------
-# run_evaluation_pipeline (uses conftest.py _mock_llm fixture)
+# _set_safe_defaults
+# ---------------------------------------------------------------------------
+class TestSetSafeDefaults:
+    def test_writes_defaults(self):
+        event = GithubEvent(
+            event_type="push",
+            payload={},
+            status="running",
+        )
+        _set_safe_defaults(event, reason="test skip")
+        assert event.status == "success"
+        assert event.final_risk_level == "unknown"
+        assert event.recommendation == "needs_review"
+        assert event.overall_score is None
+        assert event.executive_summary and "test skip" in event.executive_summary
+
+
+# ---------------------------------------------------------------------------
+# run_evaluation_pipeline
 # ---------------------------------------------------------------------------
 class TestRunEvaluationPipeline:
-    def test_all_three_rounds_succeed(self, session):
-        """Full pipeline → 3 evaluation_rounds rows, event fields updated."""
+    def test_no_cs_files_in_diff(self, session):
+        """When diff has no .cs files, pipeline sets safe defaults."""
         event = GithubEvent(
-            delivery_id="orc-full-success",
+            delivery_id="orc-no-cs",
             event_type="push",
             payload={"ref": "refs/heads/main", "commits": [{}]},
-            diff_content="diff --git a/A.cs b/A.cs\n+void Update() {}",
+            diff_content="diff --git a/readme.md b/readme.md\n+hello",
+            status="running",
+        )
+        session.add(event)
+        session.commit()
+
+        result = run_evaluation_pipeline(event, session)
+        assert result["files_evaluated"] == 0
+        assert result["status"] == "success"
+
+        reloaded = session.get(GithubEvent, event.id)
+        assert reloaded is not None
+        assert reloaded.final_risk_level == "unknown"
+        assert "no .cs files" in (reloaded.executive_summary or "")
+
+        # Should have 1 rule_check round (round 0, with total=0)
+        rounds = session.query(EvaluationRound).filter_by(event_id=event.id).all()
+        assert len(rounds) == 1
+        assert rounds[0].round_type == "rule_check"
+        assert rounds[0].round_number == 0
+
+    def test_single_cs_file_produces_two_dimensions(self, session):
+        """1 .cs file → 3 rounds: 1 rule_check + 2 dimensions."""
+        diff = (
+            "diff --git a/Assets/Scripts/Player.cs b/Assets/Scripts/Player.cs\n"
+            "+void Update() {\n"
+            "+    var x = GameObject.Find(\"Player\");\n"
+            "+}\n"
+        )
+        event = GithubEvent(
+            delivery_id="orc-1file",
+            event_type="push",
+            payload={"ref": "refs/heads/main", "commits": [{}]},
+            diff_content=diff,
             status="running",
         )
         session.add(event)
@@ -153,111 +259,44 @@ class TestRunEvaluationPipeline:
         event_id = event.id
 
         result = run_evaluation_pipeline(event, session)
+        assert result["files_evaluated"] == 1
         assert result["status"] == "success"
-        assert result["rounds_completed"] == 3
-        assert result["risk_level"] == "low"
 
         rounds = (
             session.query(EvaluationRound)
             .filter_by(event_id=event_id)
-            .order_by(EvaluationRound.round_number)
+            .order_by(EvaluationRound.round_number, EvaluationRound.id)
             .all()
         )
-        assert len(rounds) == 3
-        assert rounds[0].round_type == "rule_check"
-        assert rounds[0].status == "success"
-        assert rounds[1].round_type == "semantic_review"
-        assert rounds[1].status == "success"
-        assert rounds[2].round_type == "synthesis"
-        assert rounds[2].status == "success"
+        rule_check = [r for r in rounds if r.round_type == "rule_check"]
+        dim_a = [r for r in rounds if r.round_type == "functionality_best_practices"]
+        dim_b = [r for r in rounds if r.round_type == "security_performance_health"]
 
-        # Verify GithubEvent fields.
+        assert len(rule_check) == 1
+        assert rule_check[0].round_number == 0
+        assert len(dim_a) == 1
+        assert len(dim_b) == 1
+        assert dim_a[0].round_number == 1
+        assert dim_b[0].round_number == 1
+        assert dim_a[0].file_path == "Assets/Scripts/Player.cs"
+        assert dim_b[0].file_path == "Assets/Scripts/Player.cs"
+
+        # Check aggregated event fields
         reloaded = session.get(GithubEvent, event_id)
         assert reloaded is not None
-        assert reloaded.overall_score == 85.0
-        assert reloaded.final_risk_level == "low"
-        assert reloaded.recommendation == "merge_ready"
-        # Backward compatible.
-        assert reloaded.risk_level == "low"
-        assert reloaded.evaluation_summary == "Mocked executive summary."
+        assert reloaded.overall_score is not None
+        assert reloaded.final_risk_level is not None
+        assert reloaded.recommendation is not None
+        assert reloaded.executive_summary is not None
 
-    def test_r2_fails_r3_continues(self, session, monkeypatch):
-        """R2 returns error → R3 still executes with r2_findings=None."""
-        # Override the autouse mock: make semantic_review return an error.
-        def _failing_r2(*args, **kwargs):
-            return {
-                "findings": [],
-                "error": "Simulated R2 failure",
-                "tokens_used": 0,
-                "duration_ms": 10,
-                "model_name": "mock",
-            }
-
-        monkeypatch.setattr("unity_check.orchestrator.semantic_review", _failing_r2)
-
+    def test_aggregation_writes_dimension_scores(self, session):
+        """Event gets dimension_a_score and dimension_b_score."""
+        diff = "diff --git a/X.cs b/X.cs\n+code\n"
         event = GithubEvent(
-            delivery_id="orc-r2-fail",
-            event_type="push",
-            payload={"ref": "refs/heads/main", "commits": [{}]},
-            diff_content="diff --git a/A.cs b/A.cs",
-            status="running",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        result = run_evaluation_pipeline(event, session)
-        # Pipeline should still produce a result; R3 runs regardless.
-        rounds = (
-            session.query(EvaluationRound)
-            .filter_by(event_id=event_id)
-            .order_by(EvaluationRound.round_number)
-            .all()
-        )
-        assert len(rounds) == 3
-        r2 = [r for r in rounds if r.round_number == 2][0]
-        assert r2.status == "failed"
-        r3 = [r for r in rounds if r.round_number == 3][0]
-        assert r3.status == "success"  # R3 mock still succeeds
-        assert r3.input_summary["r2_success"] is False
-
-    def test_r2_exception_r3_continues(self, session, monkeypatch):
-        """R2 raises exception → caught, persisted as failed, R3 continues."""
-        def _crashing_r2(*args, **kwargs):
-            raise RuntimeError("Boom!")
-
-        monkeypatch.setattr("unity_check.orchestrator.semantic_review", _crashing_r2)
-
-        event = GithubEvent(
-            delivery_id="orc-r2-crash",
+            delivery_id="orc-dimscores",
             event_type="push",
             payload={},
-            status="running",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        result = run_evaluation_pipeline(event, session)
-        rounds = (
-            session.query(EvaluationRound)
-            .filter_by(event_id=event_id)
-            .order_by(EvaluationRound.round_number)
-            .all()
-        )
-        assert len(rounds) == 3
-        r2 = [r for r in rounds if r.round_number == 2][0]
-        assert r2.status == "failed"
-        assert "Boom" in (r2.error_message or "")
-        r3 = [r for r in rounds if r.round_number == 3][0]
-        assert r3.status == "success"
-
-    def test_backward_compatible_fields(self, session):
-        """risk_level and evaluation_summary are set on the event."""
-        event = GithubEvent(
-            delivery_id="orc-compat",
-            event_type="push",
-            payload={},
+            diff_content=diff,
             status="running",
         )
         session.add(event)
@@ -266,40 +305,23 @@ class TestRunEvaluationPipeline:
         run_evaluation_pipeline(event, session)
         reloaded = session.get(GithubEvent, event.id)
         assert reloaded is not None
-        assert reloaded.risk_level == "low"
-        assert reloaded.evaluation_summary == "Mocked executive summary."
+        assert reloaded.dimension_a_score is not None
+        assert reloaded.dimension_b_score is not None
 
-    def test_r3_failure_still_persists_r1_r2(self, session, monkeypatch):
-        """When R3 fails, R1 and R2 rows are still persisted, event gets safe defaults."""
-
-        def _crashing_r3(*args, **kwargs):
-            raise RuntimeError("R3 crash")
-
-        monkeypatch.setattr("unity_check.orchestrator.synthesis_summary", _crashing_r3)
-
+    def test_empty_diff_returns_safe_defaults(self, session):
+        """No diff content at all → safe defaults."""
         event = GithubEvent(
-            delivery_id="orc-r3-crash",
+            delivery_id="orc-empty-diff",
             event_type="push",
             payload={},
+            diff_content=None,
             status="running",
         )
         session.add(event)
         session.commit()
-        event_id = event.id
 
         result = run_evaluation_pipeline(event, session)
-        rounds = (
-            session.query(EvaluationRound)
-            .filter_by(event_id=event_id)
-            .order_by(EvaluationRound.round_number)
-            .all()
-        )
-        assert len(rounds) == 3
-        assert rounds[0].status == "success"  # R1 ok
-        assert rounds[1].status == "success"  # R2 ok (mock)
-        assert rounds[2].status == "failed"   # R3 crashed
-
+        assert result["files_evaluated"] == 0
         reloaded = session.get(GithubEvent, event.id)
         assert reloaded is not None
-        assert reloaded.status == "failed"
-        assert reloaded.recommendation == "needs_review"
+        assert reloaded.final_risk_level == "unknown"

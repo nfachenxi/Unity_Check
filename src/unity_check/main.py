@@ -123,25 +123,9 @@ async def receive_github_webhook(
     return {"status": "accepted", "event_id": str(event.id), "task_id": task.id}
 
 
-@app.get("/events/latest")
-def get_latest_events(limit: int = 20, db: Session = Depends(get_db)) -> list[dict[str, str | int | None]]:
-    records = db.scalars(select(GithubEvent).order_by(desc(GithubEvent.id)).limit(max(1, min(limit, 100)))).all()
-    return [
-        {
-            "id": item.id,
-            "event_type": item.event_type,
-            "action": item.action,
-            "repository": item.repository,
-            "after_sha": item.after_sha,
-            "before_sha": item.before_sha,
-            "status": item.status,
-            "risk_level": item.risk_level,
-            "task_id": item.task_id,
-            "diff_size": item.diff_size,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-        }
-        for item in records
-    ]
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
 
 
 @app.get("/api/events")
@@ -224,12 +208,22 @@ def get_events_paginated(
     }
 
 
-@app.get("/events/{event_id}")
-def get_event_detail(event_id: int, db: Session = Depends(get_db)) -> dict[str, str | int | None]:
+@app.get("/api/events/{event_id}")
+def get_event_detail(
+    event_id: int,
+    include: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return event detail, optionally including rules and assessment.
+
+    Query params:
+        include: comma-separated list — "rules", "assessment", or "rules,assessment"
+    """
     event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
     if event is None:
         raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
-    return {
+
+    result = {
         "id": event.id,
         "delivery_id": event.delivery_id,
         "event_type": event.event_type,
@@ -241,116 +235,79 @@ def get_event_detail(event_id: int, db: Session = Depends(get_db)) -> dict[str, 
         "diff_content": event.diff_content,
         "diff_size": event.diff_size,
         "status": event.status,
-        "risk_level": event.risk_level,
-        "evaluation_summary": event.evaluation_summary,
+        "overall_score": event.overall_score,
+        "final_risk_level": event.final_risk_level,
+        "recommendation": event.recommendation,
+        "executive_summary": event.executive_summary,
+        "dimension_a_score": event.dimension_a_score,
+        "dimension_b_score": event.dimension_b_score,
+        "dimension_a_summary": event.dimension_a_summary,
+        "dimension_b_summary": event.dimension_b_summary,
         "error_message": event.error_message,
         "task_id": event.task_id,
         "created_at": event.created_at.isoformat() if event.created_at else None,
         "updated_at": event.updated_at.isoformat() if event.updated_at else None,
     }
 
+    includes = set((include or "").lower().split(","))
 
-# ---------------------------------------------------------------------------
-# Rule results
-# ---------------------------------------------------------------------------
+    if "rules" in includes:
+        rules = db.scalars(
+            select(RuleResult)
+            .where(RuleResult.event_id == event_id)
+            .order_by(RuleResult.severity.desc(), RuleResult.file_path, RuleResult.line_number)
+        ).all()
+        result["rules"] = [
+            {
+                "id": r.id,
+                "rule_id": r.rule_id,
+                "rule_name": r.rule_name,
+                "file_path": r.file_path,
+                "line_number": r.line_number,
+                "column_number": r.column_number,
+                "severity": r.severity,
+                "category": r.category,
+                "message": r.message,
+                "snippet": r.snippet,
+                "scan_type": r.scan_type,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rules
+        ]
 
-
-@app.get("/events/{event_id}/rules")
-def get_event_rules(
-    event_id: int,
-    severity: str | None = None,
-    category: str | None = None,
-    rule_id: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-) -> list[dict[str, str | int | None]]:
-    """Return rule violations for an event, with optional filters."""
-    event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
-    if event is None:
-        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
-
-    stmt = select(RuleResult).where(RuleResult.event_id == event_id)
-    if severity:
-        stmt = stmt.where(RuleResult.severity == severity.capitalize())
-    if category:
-        stmt = stmt.where(RuleResult.category == category)
-    if rule_id:
-        stmt = stmt.where(RuleResult.rule_id == rule_id)
-    stmt = (
-        stmt
-        .order_by(RuleResult.severity.desc(), RuleResult.file_path, RuleResult.line_number)
-        .limit(min(limit, 500))
-        .offset(max(0, offset))
-    )
-
-    rows = db.scalars(stmt).all()
-    return [
-        {
-            "id": r.id,
-            "rule_id": r.rule_id,
-            "rule_name": r.rule_name,
-            "file_path": r.file_path,
-            "line_number": r.line_number,
-            "column_number": r.column_number,
-            "severity": r.severity,
-            "category": r.category,
-            "message": r.message,
-            "snippet": r.snippet,
-            "scan_type": r.scan_type,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+    if "assessment" in includes:
+        rounds = db.scalars(
+            select(EvaluationRound)
+            .where(EvaluationRound.event_id == event_id)
+            .order_by(EvaluationRound.round_number)
+        ).all()
+        result["assessment"] = {
+            "event_id": event.id,
+            "status": event.status,
+            "overall_score": event.overall_score,
+            "final_risk_level": event.final_risk_level,
+            "recommendation": event.recommendation,
+            "executive_summary": event.executive_summary,
+            "dimension_a_score": event.dimension_a_score,
+            "dimension_b_score": event.dimension_b_score,
+            "rounds": [
+                {
+                    "id": r.id,
+                    "round_number": r.round_number,
+                    "round_type": r.round_type,
+                    "file_path": r.file_path,
+                    "status": r.status,
+                    "score": r.score,
+                    "tokens_used": r.tokens_used,
+                    "duration_ms": r.duration_ms,
+                }
+                for r in rounds
+            ],
+            "total_tokens_used": sum(r.tokens_used or 0 for r in rounds),
+            "total_duration_ms": sum(r.duration_ms or 0 for r in rounds),
         }
-        for r in rows
-    ]
 
-
-@app.get("/rules/stats")
-def get_rules_stats(
-    repository: str | None = None,
-    days: int = 30,
-    db: Session = Depends(get_db),
-) -> dict:
-    """Aggregated rule statistics: top rules, severity breakdown, trend."""
-    from datetime import datetime, timedelta, timezone
-
-    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
-
-    # Base query
-    stmt = select(RuleResult)
-    if repository:
-        stmt = stmt.join(GithubEvent).where(
-            GithubEvent.repository == repository,
-            RuleResult.created_at >= since,
-        )
-    else:
-        stmt = stmt.where(RuleResult.created_at >= since)
-
-    rows = db.scalars(stmt).all()
-
-    # Severity breakdown
-    severity_counts: dict[str, int] = {}
-    # Top rules
-    rule_counts: dict[str, int] = {}
-    # Top files
-    file_counts: dict[str, int] = {}
-
-    for r in rows:
-        sev = r.severity.lower()
-        severity_counts[sev] = severity_counts.get(sev, 0) + 1
-        key = f"{r.rule_id}: {r.rule_name}"
-        rule_counts[key] = rule_counts.get(key, 0) + 1
-        file_counts[r.file_path] = file_counts.get(r.file_path, 0) + 1
-
-    top_rules = sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:20]
-    top_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-
-    return {
-        "total": len(rows),
-        "severity_breakdown": severity_counts,
-        "top_rules": [{"rule": k, "count": v} for k, v in top_rules],
-        "top_files": [{"file": k, "count": v} for k, v in top_files],
-        "since_days": days,
-    }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +441,11 @@ def trigger_baseline_scan(
 
 
 # ---------------------------------------------------------------------------
-# P3: Multi-round evaluation endpoints
+# Evaluation rounds
 # ---------------------------------------------------------------------------
 
 
-@app.get("/events/{event_id}/evaluations")
+@app.get("/api/events/{event_id}/evaluations")
 def get_event_evaluations(event_id: int, db: Session = Depends(get_db)) -> list[dict]:
     """Return all evaluation rounds for an event, ordered by round_number."""
     event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
@@ -506,6 +463,7 @@ def get_event_evaluations(event_id: int, db: Session = Depends(get_db)) -> list[
             "id": r.id,
             "round_number": r.round_number,
             "round_type": r.round_type,
+            "file_path": r.file_path,
             "status": r.status,
             "score": r.score,
             "model_name": r.model_name,
@@ -520,7 +478,7 @@ def get_event_evaluations(event_id: int, db: Session = Depends(get_db)) -> list[
     ]
 
 
-@app.get("/events/{event_id}/assessment")
+@app.get("/api/events/{event_id}/assessment")
 def get_event_assessment(event_id: int, db: Session = Depends(get_db)) -> dict:
     """Return the final assessment for an event.
 
@@ -544,10 +502,14 @@ def get_event_assessment(event_id: int, db: Session = Depends(get_db)) -> dict:
         "final_risk_level": event.final_risk_level,
         "recommendation": event.recommendation,
         "executive_summary": event.executive_summary,
+        "dimension_a_score": event.dimension_a_score,
+        "dimension_b_score": event.dimension_b_score,
         "rounds": [
             {
+                "id": r.id,
                 "round_number": r.round_number,
                 "round_type": r.round_type,
+                "file_path": r.file_path,
                 "status": r.status,
                 "score": r.score,
                 "tokens_used": r.tokens_used,
@@ -560,7 +522,7 @@ def get_event_assessment(event_id: int, db: Session = Depends(get_db)) -> dict:
     }
 
 
-@app.post("/events/{event_id}/re-evaluate")
+@app.post("/api/events/{event_id}/re-evaluate")
 def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
     """Delete existing evaluation rounds and re-trigger the full pipeline."""
     event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
@@ -573,12 +535,14 @@ def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
 
     # Reset event status and evaluation fields.
     event.status = "queued"
-    event.risk_level = None
-    event.evaluation_summary = None
     event.overall_score = None
     event.final_risk_level = None
     event.recommendation = None
     event.executive_summary = None
+    event.dimension_a_score = None
+    event.dimension_b_score = None
+    event.dimension_a_summary = None
+    event.dimension_b_summary = None
     db.flush()
 
     # Re-enqueue the pipeline task.
@@ -595,7 +559,7 @@ def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# P4: Notification endpoints
+# Notification endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -680,22 +644,60 @@ def update_notification_send_status(
 
 
 # ---------------------------------------------------------------------------
-# P4: Dashboard / stats API
+# Unified Dashboard / Stats API
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/dashboard/summary")
-def dashboard_summary(
+@app.get("/api/dashboard")
+def unified_dashboard(
+    section: str = "summary",
     days: int = 30,
     repository: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    limit: int = 10,
     db: Session = Depends(get_db),
-) -> dict:
+):
+    """Unified dashboard endpoint — one entry point for all dashboard/stats data.
+
+    Query params:
+        section: "summary" (default), "trends", "distribution", "scores", "hotspots"
+        days: lookback days (default 30, max 365)
+        repository: filter by repository name
+        from_date, to_date: ISO-format date range (for scores section)
+        limit: max items for hotspots (default 10, max 50)
+    """
+    from datetime import datetime, timedelta, timezone
+
+    section = section.lower().strip()
+
+    if section == "summary":
+        return _dashboard_summary(days, repository, db)
+    elif section == "trends":
+        return _dashboard_trends(days, repository, db)
+    elif section == "distribution":
+        return _dashboard_issue_distribution(days, repository, db)
+    elif section == "scores":
+        return _stats_scores(from_date, to_date, repository, db)
+    elif section == "hotspots":
+        return _stats_hotspots(limit, days, repository, db)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown section '{section}'. Valid: summary, trends, distribution, scores, hotspots",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_summary(days: int, repository: str | None, db: Session) -> dict:
     """Aggregated dashboard summary: event counts, risk distribution, score stats."""
     from datetime import datetime, timedelta, timezone
 
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
-
-    # Base query
     base = select(GithubEvent).where(GithubEvent.created_at >= since)
     if repository:
         base = base.where(GithubEvent.repository == repository)
@@ -708,19 +710,15 @@ def dashboard_summary(
     scores: list[float] = []
 
     for e in events:
-        # Risk distribution
         risk = (e.final_risk_level or "unknown").lower()
         risk_counts[risk] = risk_counts.get(risk, 0) + 1
-        # Event type
         t = e.event_type or "unknown"
         type_counts[t] = type_counts.get(t, 0) + 1
-        # Scores
         if e.overall_score is not None:
             scores.append(e.overall_score)
 
     avg_score = round(sum(scores) / len(scores), 1) if scores else None
 
-    # Recent events (last 10)
     recent = [
         {
             "id": e.id,
@@ -735,7 +733,6 @@ def dashboard_summary(
         for e in events[:10]
     ]
 
-    # Status breakdown
     status_counts: dict[str, int] = {}
     for e in events:
         s = e.status or "unknown"
@@ -752,25 +749,18 @@ def dashboard_summary(
     }
 
 
-@app.get("/api/dashboard/trends")
-def dashboard_trends(
-    days: int = 30,
-    repository: str | None = None,
-    db: Session = Depends(get_db),
-) -> list[dict]:
+def _dashboard_trends(days: int, repository: str | None, db: Session) -> list[dict]:
     """Daily trend data: score & event count per day."""
     from datetime import datetime, timedelta, timezone
 
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
-
     base = select(GithubEvent).where(GithubEvent.created_at >= since)
     if repository:
         base = base.where(GithubEvent.repository == repository)
 
     events = db.scalars(base.order_by(GithubEvent.created_at)).all()
 
-    # Group by date
-    daily: dict[str, dict[str, int | float | list]] = {}
+    daily: dict[str, dict] = {}
     for e in events:
         day = e.created_at.strftime("%Y-%m-%d") if e.created_at else "unknown"
         if day not in daily:
@@ -781,38 +771,26 @@ def dashboard_trends(
 
     result = []
     for day, data in sorted(daily.items()):
-        scores_list = data["scores"]
+        sl = data["scores"]
         result.append({
             "date": day,
             "event_count": data["count"],
-            "avg_score": round(sum(scores_list) / len(scores_list), 1) if scores_list else None,
+            "avg_score": round(sum(sl) / len(sl), 1) if sl else None,
         })
-
     return result
 
 
-@app.get("/api/dashboard/issue-distribution")
-def dashboard_issue_distribution(
-    days: int = 30,
-    repository: str | None = None,
-    db: Session = Depends(get_db),
-) -> dict:
+def _dashboard_issue_distribution(days: int, repository: str | None, db: Session) -> dict:
     """Rule and semantic finding distribution: by category, severity, source."""
     from datetime import datetime, timedelta, timezone
 
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
 
-    # Rule results
-    rule_base = (
-        select(RuleResult)
-        .join(GithubEvent)
-        .where(GithubEvent.created_at >= since)
-    )
+    rule_base = select(RuleResult).join(GithubEvent).where(GithubEvent.created_at >= since)
     if repository:
         rule_base = rule_base.where(GithubEvent.repository == repository)
     rules = db.scalars(rule_base).all()
 
-    # Category breakdown
     rule_category_counts: dict[str, int] = {}
     rule_severity_counts: dict[str, int] = {}
     for r in rules:
@@ -821,13 +799,15 @@ def dashboard_issue_distribution(
         sev = r.severity.lower()
         rule_severity_counts[sev] = rule_severity_counts.get(sev, 0) + 1
 
-    # Semantic findings from evaluation_rounds (R2 output)
+    # Semantic findings from evaluation_rounds (dimension rounds)
     eval_base = (
         select(EvaluationRound)
         .join(GithubEvent)
         .where(
             GithubEvent.created_at >= since,
-            EvaluationRound.round_number == 2,
+            EvaluationRound.round_type.in_(
+                ["functionality_best_practices", "security_performance_health"]
+            ),
             EvaluationRound.status == "success",
         )
     )
@@ -860,24 +840,14 @@ def dashboard_issue_distribution(
     }
 
 
-@app.get("/api/stats/scores")
-def stats_scores(
-    from_date: str | None = None,
-    to_date: str | None = None,
-    repository: str | None = None,
-    db: Session = Depends(get_db),
+def _stats_scores(
+    from_date: str | None, to_date: str | None,
+    repository: str | None, db: Session,
 ) -> dict:
-    """Score statistics over a date range.
-
-    Query params: from_date / to_date in ISO format (e.g. 2026-05-01).
-    """
+    """Score statistics over a date range."""
     from datetime import datetime, timezone
 
-    base = select(
-        GithubEvent.overall_score,
-        GithubEvent.final_risk_level,
-        GithubEvent.created_at,
-    )
+    base = select(GithubEvent.overall_score, GithubEvent.final_risk_level, GithubEvent.created_at)
     if from_date:
         try:
             f = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
@@ -909,18 +879,11 @@ def stats_scores(
     }
 
 
-@app.get("/api/stats/hotspots")
-def stats_hotspots(
-    limit: int = 10,
-    days: int = 30,
-    repository: str | None = None,
-    db: Session = Depends(get_db),
-) -> list[dict]:
+def _stats_hotspots(limit: int, days: int, repository: str | None, db: Session) -> list[dict]:
     """Top files by rule-result count (hotspots)."""
     from datetime import datetime, timedelta, timezone
 
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
-
     base = (
         select(RuleResult.file_path, func.count().label("cnt"))
         .join(GithubEvent)
@@ -929,11 +892,9 @@ def stats_hotspots(
     if repository:
         base = base.where(GithubEvent.repository == repository)
     base = (
-        base
-        .group_by(RuleResult.file_path)
+        base.group_by(RuleResult.file_path)
         .order_by(func.count().desc())
         .limit(min(limit, 50))
     )
-
     rows = db.execute(base).all()
     return [{"file": r[0], "count": r[1]} for r in rows]

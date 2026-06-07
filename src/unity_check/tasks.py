@@ -205,12 +205,10 @@ def process_github_event(event_id: int) -> dict[str, str]:
                     rule_count, event_id,
                 )
 
-            # Multi-round evaluation pipeline (P3).
-            # Replaces the old single-round evaluate_with_llm call.
+            # Per-file, per-dimension evaluation pipeline.
             pipeline_result = run_evaluation_pipeline(event, db)
-            # The orchestrator already sets event.risk_level, evaluation_summary,
-            # overall_score, final_risk_level, recommendation, executive_summary,
-            # and event.status — no further assignment needed here.
+            # The orchestrator sets all evaluation fields on event. No further
+            # assignment needed here.
             event_status = pipeline_result.get("status", "success")
     except Exception as exc:
         # Persist failure details so the pipeline can be traced from UI/query endpoints.
@@ -230,7 +228,7 @@ def process_github_event(event_id: int) -> dict[str, str]:
         return {
             "status": event_status,
             "event_id": str(event_id),
-            "risk_level": str(event.risk_level),
+            "risk_level": str(event.final_risk_level),
         }
     finally:
         db.close()

@@ -1,4 +1,4 @@
-"""Tests for webhook parsing and new GET /events/{event_id} endpoint."""
+"""Tests for webhook parsing and event endpoints (v2 simplified)."""
 
 import json
 from unittest.mock import patch
@@ -18,15 +18,9 @@ def _fake_task_id() -> str:
 
 @pytest.fixture(autouse=True)
 def _override_dependencies(monkeypatch, session):
-    """Override FastAPI dependencies and Celery tasks for testing.
-
-    Uses app.dependency_overrides (canonical FastAPI test approach)
-    rather than monkeypatch on Depends imports.
-    """
-    # FastAPI dependency override — canonical approach
+    """Override FastAPI dependencies and Celery tasks for testing."""
     app.dependency_overrides[get_db] = lambda: session
 
-    # Mock process_github_event.delay so we never touch Celery/Redis
     class _FakeAsyncResult:
         def __init__(self, event_id):
             self.id = _fake_task_id()
@@ -39,8 +33,6 @@ def _override_dependencies(monkeypatch, session):
     monkeypatch.setattr("unity_check.tasks.SessionLocal", lambda: session)
 
     yield
-
-    # Cleanup
     app.dependency_overrides.clear()
 
 
@@ -142,8 +134,9 @@ class TestWebhookPush:
         assert resp.status_code == 202
         data = resp.json()
         assert data["status"] == "accepted"
-        latest = client.get("/events/latest").json()
-        ids = [e["id"] for e in latest]
+        # Verify event is queryable via /api/events
+        events_resp = client.get("/api/events").json()
+        ids = [e["id"] for e in events_resp["items"]]
         assert int(data["event_id"]) in ids
 
     def test_sha_extracted_for_push(self, client, session):
@@ -157,7 +150,7 @@ class TestWebhookPush:
         )
         assert resp.status_code == 202
         event_id = resp.json()["event_id"]
-        detail = client.get(f"/events/{event_id}").json()
+        detail = client.get(f"/api/events/{event_id}").json()
         assert detail["after_sha"] == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         assert detail["before_sha"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -172,7 +165,7 @@ class TestWebhookPush:
         )
         assert resp.status_code == 202
         event_id = resp.json()["event_id"]
-        detail = client.get(f"/events/{event_id}").json()
+        detail = client.get(f"/api/events/{event_id}").json()
         assert detail["before_sha"] == "base-sha-40-chars-base-sha-40-charsss"
         assert detail["after_sha"] == "head-sha-40-chars-head-sha-40-charsss"
 
@@ -224,49 +217,6 @@ class TestWebhookValidation:
         assert resp.status_code == 401
 
 
-class TestEventsLatest:
-    def test_empty_db_returns_list_not_error(self, client):
-        resp = client.get("/events/latest")
-        assert resp.status_code == 200
-        assert isinstance(resp.json(), list)
-
-    def test_returns_recent_events(self, client, session):
-        for i in range(2):
-            client.post(
-                "/webhook/github",
-                headers={
-                    "X-GitHub-Event": "push",
-                    "X-GitHub-Delivery": f"delivery-latest-{i}",
-                },
-                content=json.dumps({
-                    "ref": "refs/heads/main",
-                    "before": "a" * 40,
-                    "after": "b" * 40,
-                    "repository": {"full_name": "test/repo"},
-                }).encode(),
-            )
-        session.flush()
-        resp = client.get("/events/latest?limit=10")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) >= 2
-        item = data[0]
-        assert "id" in item
-        assert "event_type" in item
-        assert "status" in item
-        assert "risk_level" in item
-        assert "after_sha" in item
-        assert "diff_size" in item
-
-    def test_limit_capped_at_100(self, client, session):
-        resp = client.get("/events/latest?limit=999")
-        assert resp.status_code == 200
-
-    def test_limit_floor_1(self, client, session):
-        resp = client.get("/events/latest?limit=0")
-        assert resp.status_code == 200
-
-
 class TestEventDetail:
     def test_returns_full_event(self, client, session):
         resp = client.post(
@@ -284,193 +234,66 @@ class TestEventDetail:
         )
         assert resp.status_code == 202
         event_id = resp.json()["event_id"]
-        detail = client.get(f"/events/{event_id}").json()
+        detail = client.get(f"/api/events/{event_id}").json()
         assert detail["id"] == int(event_id)
         assert detail["event_type"] == "push"
         assert "diff_content" in detail
         assert "clone_path" in detail
-        assert "evaluation_summary" in detail
+        assert "dimension_a_score" in detail
+        assert "dimension_b_score" in detail
+        assert "final_risk_level" in detail
         assert "updated_at" in detail
 
+    def test_includes_rules_when_requested(self, client, session):
+        event = GithubEvent(
+            delivery_id="rules-include",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+        session.add(RuleResult(
+            event_id=event_id, rule_id="R1", rule_name="Rule One",
+            file_path="A.cs", severity="Warning", category="Perf",
+            message="m", scan_type="incremental",
+        ))
+        session.commit()
+
+        resp = client.get(f"/api/events/{event_id}?include=rules")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "rules" in data
+        assert len(data["rules"]) == 1
+
+    def test_includes_assessment_when_requested(self, client, session):
+        event = GithubEvent(
+            delivery_id="assess-include",
+            event_type="push",
+            payload={},
+            status="success",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+        session.add(EvaluationRound(
+            event_id=event_id, round_number=0, round_type="rule_check",
+            status="success", input_summary={}, output_data={"total": 0},
+        ))
+        session.commit()
+
+        resp = client.get(f"/api/events/{event_id}?include=assessment")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "assessment" in data
+        assert len(data["assessment"]["rounds"]) == 1
+
     def test_nonexistent_event_returns_404(self, client):
-        resp = client.get("/events/99999")
+        resp = client.get("/api/events/99999")
         assert resp.status_code == 404
-
-
-class TestEventRules:
-    def test_empty_rules_for_event(self, client, session):
-        """An event without rule_results should return an empty list."""
-        event = GithubEvent(
-            delivery_id="rules-empty-web",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-        session.expunge(event)
-
-        resp = client.get(f"/events/{event_id}/rules")
-        assert resp.status_code == 200
-        assert resp.json() == []
-
-    def test_returns_rules_for_event(self, client, session):
-        """Rules persisted for an event should be returned."""
-        event = GithubEvent(
-            delivery_id="rules-web",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        rules = [
-            RuleResult(
-                event_id=event_id,
-                rule_id="CA1822",
-                rule_name="Member can be static",
-                file_path="Assets/A.cs",
-                line_number=10,
-                severity="Warning",
-                category="Performance",
-                message="msg",
-                scan_type="incremental",
-            ),
-            RuleResult(
-                event_id=event_id,
-                rule_id="SA1300",
-                rule_name="Upper case",
-                file_path="Assets/B.cs",
-                line_number=1,
-                severity="Error",
-                category="Naming",
-                message="naming issue",
-                scan_type="incremental",
-            ),
-        ]
-        session.add_all(rules)
-        session.commit()
-
-        resp = client.get(f"/events/{event_id}/rules")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 2
-
-    def test_filter_by_severity(self, client, session):
-        """Should only return rules matching the severity filter."""
-        event = GithubEvent(
-            delivery_id="rules-filter-sev",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        session.add(RuleResult(
-            event_id=event_id, rule_id="R1", rule_name="n",
-            file_path="A.cs", severity="Warning", category="C1",
-            message="m", scan_type="incremental",
-        ))
-        session.add(RuleResult(
-            event_id=event_id, rule_id="R2", rule_name="n",
-            file_path="B.cs", severity="Error", category="C2",
-            message="m", scan_type="incremental",
-        ))
-        session.commit()
-
-        resp = client.get(f"/events/{event_id}/rules?severity=Error")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 1
-        assert data[0]["severity"] == "Error"
-
-    def test_filter_by_rule_id(self, client, session):
-        """Should only return rules matching the rule_id filter."""
-        event = GithubEvent(
-            delivery_id="rules-filter-rid",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        session.add(RuleResult(
-            event_id=event_id, rule_id="CA1822", rule_name="n",
-            file_path="A.cs", severity="Warning", category="C1",
-            message="m", scan_type="incremental",
-        ))
-        session.add(RuleResult(
-            event_id=event_id, rule_id="RCS1005", rule_name="n",
-            file_path="B.cs", severity="Warning", category="C2",
-            message="m", scan_type="incremental",
-        ))
-        session.commit()
-
-        resp = client.get(f"/events/{event_id}/rules?rule_id=CA1822")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 1
-        assert data[0]["rule_id"] == "CA1822"
-
-    def test_nonexistent_event_404(self, client):
-        resp = client.get("/events/99999/rules")
-        assert resp.status_code == 404
-
-
-class TestRulesStats:
-    def test_empty_stats(self, client):
-        resp = client.get("/rules/stats")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total"] == 0
-        assert "severity_breakdown" in data
-        assert "top_rules" in data
-
-    def test_stats_with_data(self, client, session):
-        event = GithubEvent(
-            delivery_id="stats-event",
-            event_type="push",
-            payload={},
-            status="success",
-            repository="test/stats-repo",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        session.add_all([
-            RuleResult(
-                event_id=event_id, rule_id="R1", rule_name="Rule 1",
-                file_path="A.cs", severity="Warning", category="Perf",
-                message="m", scan_type="incremental",
-            ),
-            RuleResult(
-                event_id=event_id, rule_id="R1", rule_name="Rule 1",
-                file_path="B.cs", severity="Warning", category="Perf",
-                message="m", scan_type="incremental",
-            ),
-            RuleResult(
-                event_id=event_id, rule_id="R2", rule_name="Rule 2",
-                file_path="A.cs", severity="Error", category="Naming",
-                message="m", scan_type="incremental",
-            ),
-        ])
-        session.commit()
-
-        resp = client.get("/rules/stats?days=365")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total"] == 3
-        assert data["severity_breakdown"] == {"warning": 2, "error": 1}
-        assert len(data["top_rules"]) == 2
-        assert len(data["top_files"]) > 0
 
 
 class TestRepoConfig:
@@ -500,18 +323,15 @@ class TestRepoConfig:
         assert "Custom/Scripts" in data["analyze_paths"]
         assert "Custom/Editor" in data["analyze_paths"]
 
-        # GET should return updated
         resp2 = client.get("/repos/test-put/config")
         assert resp2.status_code == 200
         assert "Custom/Scripts" in resp2.json()["analyze_paths"]
 
     def test_put_updates_existing(self, client, session):
-        # First PUT creates
         client.put(
             "/repos/test-update/config",
             json={"analyze_paths": ["Path1"]},
         )
-        # Second PUT updates
         resp = client.put(
             "/repos/test-update/config",
             json={"analyze_paths": ["Path2"], "is_baseline_scanned": True},

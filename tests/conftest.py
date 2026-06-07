@@ -37,20 +37,23 @@ def session(engine):
 
 @pytest.fixture(autouse=True)
 def _mock_llm(monkeypatch):
-    """Prevent any real LLM API call in the test suite."""
+    """Prevent any real LLM API call in the test suite.
 
-    def fake_evaluate(event_type, action, summary, diff_content=""):
-        return {"risk_level": "low", "summary": "mocked summary"}
+    Mocks evaluate_file_dimension to return canned results for both dimensions.
+    """
 
-    def fake_semantic_review(diff_content, rule_results_summary, event_summary):
+    def fake_evaluate_file_dimension(file_path, file_diff, file_rule_results, event_summary, dimension):
         return {
+            "score": 85.0,
+            "summary": f"Mocked {dimension} for {file_path}",
             "findings": [
                 {
                     "title": "Mocked finding",
-                    "category": "architecture",
+                    "category": "best_practice" if "func" in dimension else "performance",
                     "severity": "low",
                     "description": "Mocked description",
                     "suggestion": "Mocked suggestion",
+                    "line_hint": "line 10",
                 }
             ],
             "tokens_used": 100,
@@ -58,38 +61,15 @@ def _mock_llm(monkeypatch):
             "model_name": "deepseek-chat-mock",
         }
 
-    def fake_synthesis_summary(diff_content, rule_results_summary, r2_findings, event_summary):
-        return {
-            "overall_score": 85.0,
-            "risk_level": "low",
-            "executive_summary": "Mocked executive summary.",
-            "top_issues": [
-                {"title": "Mocked issue", "severity": "low", "source": "semantic_review"},
-            ],
-            "recommendation": "merge_ready",
-            "action_items": [
-                {"action": "Mocked action", "priority": "low"},
-            ],
-            "tokens_used": 200,
-            "duration_ms": 800,
-            "model_name": "deepseek-chat-mock",
-        }
-
-    monkeypatch.setattr("unity_check.llm.evaluate_with_llm", fake_evaluate)
-    monkeypatch.setattr("unity_check.llm.semantic_review", fake_semantic_review)
-    monkeypatch.setattr("unity_check.llm.synthesis_summary", fake_synthesis_summary)
-    monkeypatch.setattr("unity_check.orchestrator.semantic_review", fake_semantic_review)
-    monkeypatch.setattr("unity_check.orchestrator.synthesis_summary", fake_synthesis_summary)
-    # tasks.py no longer imports evaluate_with_llm; it uses run_evaluation_pipeline directly.
+    monkeypatch.setattr(
+        "unity_check.orchestrator.evaluate_file_dimension",
+        fake_evaluate_file_dimension,
+    )
 
 
 @pytest.fixture(autouse=True)
 def _mock_roslyn(monkeypatch):
-    """Prevent any real Roslyn HTTP calls in the test suite.
-
-    Also patches task-local imports so process_github_event and
-    run_baseline_scan_task never make real HTTP requests.
-    """
+    """Prevent any real Roslyn HTTP calls in the test suite."""
 
     def fake_run_roslyn_analysis(files):
         return []

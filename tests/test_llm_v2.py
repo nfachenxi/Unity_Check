@@ -1,4 +1,4 @@
-"""Tests for llm.py v2 — retry logic, semantic_review, synthesis_summary, backward compat."""
+"""Tests for llm.py v2 — retry logic, per-file dimension evaluation."""
 
 import json
 
@@ -7,9 +7,7 @@ import pytest
 from unity_check.llm import (
     PROMPT_TEMPLATES,
     _call_llm_with_retry,
-    evaluate_with_llm,
-    semantic_review,
-    synthesis_summary,
+    evaluate_file_dimension,
 )
 
 
@@ -36,23 +34,10 @@ class TestCallLlmWithRetry:
 
         calls = []
 
-        class FakeClient:
-            def __init__(self, *args, **kwargs):
-                self.chat = type("FakeChat", (), {"completions": type("FakeCompletions", (), {})()})()
-
-            @property
-            def chat(self):
-                return self._chat
-
-            @chat.setter
-            def chat(self, value):
-                self._chat = value
-
         def fake_create(*, model, messages, temperature):
             calls.append(1)
             return fake_response
 
-        monkeypatch.setattr("openai.OpenAI", lambda *a, **kw: None)
         monkeypatch.setattr(
             "unity_check.llm._build_client",
             lambda: type(
@@ -77,7 +62,6 @@ class TestCallLlmWithRetry:
 
     def test_retry_on_json_parse_error(self, monkeypatch):
         """Invalid JSON on first attempt → retry succeeds on second."""
-
         attempts = []
 
         def fake_create(*, model, messages, temperature):
@@ -134,7 +118,6 @@ class TestCallLlmWithRetry:
 
     def test_exhausts_retries(self, monkeypatch):
         """All 3 attempts return invalid JSON → RuntimeError."""
-
         def fake_create(*, model, messages, temperature):
             return type(
                 "FakeResponse",
@@ -165,8 +148,6 @@ class TestCallLlmWithRetry:
                 },
             )(),
         )
-
-        # Speed up retries for test.
         monkeypatch.setattr("unity_check.llm.RETRY_BACKOFF_BASE", 0.001)
 
         with pytest.raises(RuntimeError, match="exhausted"):
@@ -174,7 +155,6 @@ class TestCallLlmWithRetry:
 
     def test_retry_on_api_error(self, monkeypatch):
         """API error on first attempt → retry succeeds."""
-
         attempts = []
 
         def fake_create(*, model, messages, temperature):
@@ -218,150 +198,50 @@ class TestCallLlmWithRetry:
 
 
 # ---------------------------------------------------------------------------
-# semantic_review
+# evaluate_file_dimension — dimension A
 # ---------------------------------------------------------------------------
-class TestSemanticReview:
-    def test_returns_findings(self, monkeypatch):
-        """semantic_review should parse findings from LLM response."""
-        r2_output = {
+class TestEvaluateFileDimensionA:
+    def test_returns_score_and_findings(self, monkeypatch):
+        """evaluate_file_dimension with dimension A returns score + findings."""
+        fake_output = {
+            "score": 88.0,
+            "summary": "代码质量良好，符合Unity最佳实践",
             "findings": [
                 {
-                    "title": "Unity anti-pattern",
-                    "category": "unity_anti_pattern",
-                    "severity": "high",
-                    "description": "Using FindObjectOfType in Update",
-                    "suggestion": "Cache the reference",
+                    "title": "建议缓存GetComponent结果",
+                    "category": "best_practice",
+                    "severity": "medium",
+                    "description": "在Update中调用GetComponent会产生性能开销",
+                    "suggestion": "在Awake中缓存引用",
                 }
-            ]
+            ],
         }
 
         monkeypatch.setattr(
             "unity_check.llm._call_llm_with_retry",
             lambda system_prompt, user_content, model_name=None: {
-                "result": r2_output,
+                "result": fake_output,
                 "tokens_used": 500,
                 "duration_ms": 2000,
                 "model_name": "deepseek-chat",
             },
         )
 
-        result = semantic_review(
-            diff_content="+void Update() { var x = FindObjectOfType<Player>(); }",
-            rule_results_summary={"total": 0},
+        result = evaluate_file_dimension(
+            file_path="Assets/Scripts/Player.cs",
+            file_diff="+void Update() { GetComponent<Rigidbody>(); }",
+            file_rule_results=[],
             event_summary="push to main, commits=1",
+            dimension="functionality_best_practices",
         )
+        assert result["score"] == 88.0
+        assert result["summary"] and "Unity" in result["summary"]
         assert len(result["findings"]) == 1
-        assert result["findings"][0]["severity"] == "high"
+        assert result["findings"][0]["severity"] == "medium"
         assert result["tokens_used"] == 500
         assert result["model_name"] == "deepseek-chat"
 
     def test_empty_findings_when_no_api_key(self, monkeypatch):
-        """When LLM_API_KEY is empty, return empty findings + error note."""
-        monkeypatch.setattr("unity_check.llm.get_settings", lambda: type(
-            "FakeSettings",
-            (),
-            {"llm_api_key": "", "llm_model": "test-model", "llm_base_url": "http://x"},
-        )())
-
-        result = semantic_review("diff", {"total": 0}, "summary")
-        assert result["findings"] == []
-        assert result.get("error") == "LLM_API_KEY is empty"
-
-    def test_handles_llm_failure(self, monkeypatch):
-        """When _call_llm_with_retry raises, return empty findings + error."""
-        monkeypatch.setattr(
-            "unity_check.llm._call_llm_with_retry",
-            lambda system_prompt, user_content, model_name=None: (_ for _ in ()).throw(
-                RuntimeError("all retries exhausted")
-            ),
-        )
-
-        result = semantic_review("diff", {"total": 0}, "summary")
-        assert result["findings"] == []
-        assert "all retries exhausted" in result.get("error", "")
-
-    def test_findings_not_a_list_is_normalized(self, monkeypatch):
-        """If LLM returns findings as non-list, normalize to empty list."""
-        monkeypatch.setattr(
-            "unity_check.llm._call_llm_with_retry",
-            lambda system_prompt, user_content, model_name=None: {
-                "result": {"findings": "not_a_list"},
-                "tokens_used": 100,
-                "duration_ms": 500,
-                "model_name": "deepseek-chat",
-            },
-        )
-
-        result = semantic_review("diff", {"total": 0}, "summary")
-        assert result["findings"] == []
-
-
-# ---------------------------------------------------------------------------
-# synthesis_summary
-# ---------------------------------------------------------------------------
-class TestSynthesisSummary:
-    def test_returns_complete_assessment(self, monkeypatch):
-        """synthesis_summary should return all required fields."""
-        r3_output = {
-            "overall_score": 85.0,
-            "risk_level": "low",
-            "executive_summary": "Clean change.",
-            "top_issues": [{"title": "Minor naming", "severity": "low", "source": "rule_check"}],
-            "recommendation": "merge_ready",
-            "action_items": [{"action": "Rename variable", "priority": "low"}],
-        }
-
-        monkeypatch.setattr(
-            "unity_check.llm._call_llm_with_retry",
-            lambda system_prompt, user_content, model_name=None: {
-                "result": r3_output,
-                "tokens_used": 600,
-                "duration_ms": 1800,
-                "model_name": "deepseek-chat",
-            },
-        )
-
-        result = synthesis_summary(
-            diff_content="+int x = 1;",
-            rule_results_summary={"total": 1},
-            r2_findings=[{"title": "ok"}],
-            event_summary="push to main",
-        )
-        assert result["overall_score"] == 85.0
-        assert result["risk_level"] == "low"
-        assert result["recommendation"] == "merge_ready"
-        assert len(result["top_issues"]) == 1
-        assert len(result["action_items"]) == 1
-
-    def test_handles_missing_r2_findings(self, monkeypatch):
-        """When r2_findings is None, R3 still produces output."""
-        monkeypatch.setattr(
-            "unity_check.llm._call_llm_with_retry",
-            lambda system_prompt, user_content, model_name=None: {
-                "result": {
-                    "overall_score": 60.0,
-                    "risk_level": "high",
-                    "executive_summary": "Only static analysis available.",
-                    "top_issues": [],
-                    "recommendation": "needs_review",
-                    "action_items": [],
-                },
-                "tokens_used": 300,
-                "duration_ms": 1000,
-                "model_name": "deepseek-chat",
-            },
-        )
-
-        result = synthesis_summary(
-            diff_content="diff",
-            rule_results_summary={"total": 0},
-            r2_findings=None,
-            event_summary="push",
-        )
-        assert result["risk_level"] == "high"
-        assert result["recommendation"] == "needs_review"
-
-    def test_no_api_key_returns_safe_defaults(self, monkeypatch):
         """When LLM_API_KEY is empty, return safe defaults."""
         monkeypatch.setattr("unity_check.llm.get_settings", lambda: type(
             "FakeSettings",
@@ -369,112 +249,135 @@ class TestSynthesisSummary:
             {"llm_api_key": "", "llm_model": "test-model", "llm_base_url": "http://x"},
         )())
 
-        result = synthesis_summary("diff", {"total": 0}, [], "summary")
-        assert result["overall_score"] == 0.0
-        assert result["risk_level"] == "unknown"
-        assert result["recommendation"] == "needs_review"
+        result = evaluate_file_dimension(
+            file_path="X.cs", file_diff="diff",
+            file_rule_results=[], event_summary="summary",
+            dimension="functionality_best_practices",
+        )
+        assert result["score"] == 0.0
+        assert result["findings"] == []
+        assert result.get("error") == "LLM_API_KEY is empty"
 
     def test_handles_llm_failure(self, monkeypatch):
         """When _call_llm_with_retry raises, return safe defaults + error."""
         monkeypatch.setattr(
             "unity_check.llm._call_llm_with_retry",
             lambda system_prompt, user_content, model_name=None: (_ for _ in ()).throw(
-                RuntimeError("API timeout")
+                RuntimeError("all retries exhausted")
             ),
         )
 
-        result = synthesis_summary("diff", {"total": 0}, [], "summary")
-        assert result["overall_score"] == 0.0
-        assert result["risk_level"] == "unknown"
-        assert "API timeout" in result.get("error", "")
-
-
-# ---------------------------------------------------------------------------
-# evaluate_with_llm backward compat
-# ---------------------------------------------------------------------------
-class TestEvaluateWithLlmBackwardCompat:
-    def test_returns_legacy_format(self, monkeypatch):
-        """evaluate_with_llm should return {risk_level, summary} dict."""
-        monkeypatch.setattr(
-            "unity_check.llm.semantic_review",
-            lambda diff_content, rule_results_summary, event_summary: {
-                "findings": [
-                    {
-                        "title": "Performance issue",
-                        "severity": "high",
-                        "category": "performance",
-                        "description": "desc",
-                        "suggestion": "fix",
-                    }
-                ],
-                "tokens_used": 200,
-                "duration_ms": 1000,
-                "model_name": "deepseek-chat",
-            },
+        result = evaluate_file_dimension(
+            file_path="X.cs", file_diff="diff",
+            file_rule_results=[], event_summary="summary",
+            dimension="functionality_best_practices",
         )
+        assert result["score"] == 0.0
+        assert "all retries exhausted" in result.get("error", "")
 
-        result = evaluate_with_llm("push", None, "push to main", diff_content="+void Update()")
-        assert "risk_level" in result
-        assert "summary" in result
-        assert result["risk_level"] == "high"
-        assert "Performance issue" in result["summary"]
-
-    def test_no_api_key_returns_unknown(self, monkeypatch):
-        """When LLM_API_KEY is empty, legacy function returns unknown."""
-        monkeypatch.setattr("unity_check.llm.get_settings", lambda: type(
-            "FakeSettings",
-            (),
-            {"llm_api_key": "", "llm_model": "test-model", "llm_base_url": "http://x"},
-        )())
-
-        result = evaluate_with_llm("push", None, "summary")
-        assert result["risk_level"] == "unknown"
-        assert "LLM_API_KEY" in result["summary"]
-
-    def test_no_findings_returns_low(self, monkeypatch):
-        """When semantic_review returns no findings, risk is low."""
+    def test_findings_not_a_list_is_normalized(self, monkeypatch):
+        """If LLM returns findings as non-list, normalize to empty list."""
         monkeypatch.setattr(
-            "unity_check.llm.semantic_review",
-            lambda diff_content, rule_results_summary, event_summary: {
-                "findings": [],
+            "unity_check.llm._call_llm_with_retry",
+            lambda system_prompt, user_content, model_name=None: {
+                "result": {"score": 80, "summary": "ok", "findings": "not_a_list"},
                 "tokens_used": 100,
                 "duration_ms": 500,
                 "model_name": "deepseek-chat",
             },
         )
 
-        result = evaluate_with_llm("push", None, "push to main")
-        assert result["risk_level"] == "low"
+        result = evaluate_file_dimension(
+            file_path="X.cs", file_diff="diff",
+            file_rule_results=[], event_summary="summary",
+            dimension="functionality_best_practices",
+        )
+        assert result["findings"] == []
 
-    def test_semantic_review_error_propagates(self, monkeypatch):
-        """When semantic_review returns error, legacy function reports it."""
+
+# ---------------------------------------------------------------------------
+# evaluate_file_dimension — dimension B
+# ---------------------------------------------------------------------------
+class TestEvaluateFileDimensionB:
+    def test_returns_score_and_findings_b(self, monkeypatch):
+        """evaluate_file_dimension with dimension B returns score + findings."""
+        fake_output = {
+            "score": 65.0,
+            "summary": "存在性能和安全问题需要修复",
+            "findings": [
+                {
+                    "title": "Update中频繁分配新对象",
+                    "category": "performance",
+                    "severity": "high",
+                    "description": "每帧创建新的List对象导致GC压力",
+                    "suggestion": "将List移到类字段并在Awake初始化",
+                }
+            ],
+        }
+
         monkeypatch.setattr(
-            "unity_check.llm.semantic_review",
-            lambda diff_content, rule_results_summary, event_summary: {
-                "findings": [],
-                "error": "API crashed",
-                "tokens_used": 0,
-                "duration_ms": 0,
-                "model_name": "",
+            "unity_check.llm._call_llm_with_retry",
+            lambda system_prompt, user_content, model_name=None: {
+                "result": fake_output,
+                "tokens_used": 400,
+                "duration_ms": 1500,
+                "model_name": "deepseek-chat",
             },
         )
 
-        result = evaluate_with_llm("push", None, "summary")
-        assert result["risk_level"] == "unknown"
-        assert "API crashed" in result["summary"]
+        result = evaluate_file_dimension(
+            file_path="Assets/Scripts/Enemy.cs",
+            file_diff="+void Update() { new List<int>(); }",
+            file_rule_results=[{"rule_id": "CA1822", "severity": "Warning"}],
+            event_summary="pull_request #5, action=opened",
+            dimension="security_performance_health",
+        )
+        assert result["score"] == 65.0
+        assert len(result["findings"]) == 1
+        assert result["findings"][0]["severity"] == "high"
+        assert result["tokens_used"] == 400
+
+    def test_no_api_key_returns_defaults(self, monkeypatch):
+        monkeypatch.setattr("unity_check.llm.get_settings", lambda: type(
+            "FakeSettings",
+            (),
+            {"llm_api_key": "", "llm_model": "test-model", "llm_base_url": "http://x"},
+        )())
+
+        result = evaluate_file_dimension(
+            file_path="X.cs", file_diff="diff",
+            file_rule_results=[], event_summary="summary",
+            dimension="security_performance_health",
+        )
+        assert result["score"] == 0.0
+        assert result["findings"] == []
+
+    def test_unknown_dimension(self, monkeypatch):
+        """Unknown dimension returns error."""
+        result = evaluate_file_dimension(
+            file_path="X.cs", file_diff="diff",
+            file_rule_results=[], event_summary="summary",
+            dimension="nonexistent_dimension",
+        )
+        assert result["score"] == 0.0
+        assert "Unknown dimension" in result.get("error", "")
 
 
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 class TestPromptTemplates:
-    def test_semantic_review_template_exists(self):
-        assert "semantic_review" in PROMPT_TEMPLATES
-        assert "Unity C#" in PROMPT_TEMPLATES["semantic_review"]
+    def test_dimension_a_template_exists(self):
+        assert "functionality_best_practices" in PROMPT_TEMPLATES
+        assert "Unity" in PROMPT_TEMPLATES["functionality_best_practices"]
+        assert "功能" in PROMPT_TEMPLATES["functionality_best_practices"]
 
-    def test_synthesis_template_exists(self):
-        assert "synthesis_summary" in PROMPT_TEMPLATES
-        assert "overall_score" in PROMPT_TEMPLATES["synthesis_summary"]
+    def test_dimension_b_template_exists(self):
+        assert "security_performance_health" in PROMPT_TEMPLATES
+        assert "GC" in PROMPT_TEMPLATES["security_performance_health"]
+        assert "安全" in PROMPT_TEMPLATES["security_performance_health"]
 
-    def test_legacy_template_exists(self):
-        assert "legacy_triage" in PROMPT_TEMPLATES
+    def test_old_templates_removed(self):
+        assert "semantic_review" not in PROMPT_TEMPLATES
+        assert "synthesis_summary" not in PROMPT_TEMPLATES
+        assert "legacy_triage" not in PROMPT_TEMPLATES

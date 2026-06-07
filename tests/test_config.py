@@ -33,7 +33,6 @@ class TestSettingsLoading:
         assert settings.app_host == "0.0.0.0"
         assert settings.app_port == 8000
         assert settings.app_log_level == "INFO"
-        assert settings.llm_provider == "deepseek"
         assert settings.llm_base_url == "https://api.deepseek.com"
         assert settings.llm_model == "deepseek-chat"
 

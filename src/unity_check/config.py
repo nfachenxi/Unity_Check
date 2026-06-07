@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     github_webhook_secret: str = Field(default="", alias="GITHUB_WEBHOOK_SECRET")
     github_remote_repo: str = Field(alias="GITHUB_REMOTE_REPO")
 
-    llm_provider: str = Field(default="deepseek", alias="LLM_PROVIDER")
     llm_base_url: str = Field(default="https://api.deepseek.com", alias="LLM_BASE_URL")
     llm_model: str = Field(default="deepseek-chat", alias="LLM_MODEL")
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
@@ -30,7 +29,6 @@ class Settings(BaseSettings):
 
     git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
 
-    notify_risk_threshold: str = Field(default="medium", alias="NOTIFY_RISK_THRESHOLD")
     notify_score_threshold: float = Field(default=70.0, alias="NOTIFY_SCORE_THRESHOLD")
 
 
