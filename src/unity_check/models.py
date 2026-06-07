@@ -7,7 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from unity_check.db import Base
 
 if TYPE_CHECKING:
-    from unity_check.models import EvaluationRound, RuleResult, Notification
+    pass
 
 
 class GithubEvent(Base):
@@ -43,47 +43,9 @@ class GithubEvent(Base):
     )
 
     # relationships
-    rule_results: Mapped[list["RuleResult"]] = relationship(
-        back_populates="event", cascade="all, delete-orphan"
-    )
     evaluation_rounds: Mapped[list["EvaluationRound"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
-    notifications: Mapped[list["Notification"]] = relationship(
-        back_populates="event", cascade="all, delete-orphan"
-    )
-
-
-class RuleResult(Base):
-    """Rule violations detected by the Roslyn analyzer for a specific event."""
-
-    __tablename__ = "rule_results"
-    __table_args__ = (
-        Index("idx_rule_results_event_rule", "event_id", "rule_id"),
-        Index("idx_rule_results_event_severity", "event_id", "severity"),
-        Index("idx_rule_results_event_category", "event_id", "category"),
-        Index("idx_rule_results_rule_severity", "rule_id", "severity", "created_at"),
-        Index("idx_rule_results_file_path", "file_path"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    event_id: Mapped[int] = mapped_column(
-        ForeignKey("github_events.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    rule_id: Mapped[str] = mapped_column(String(32), index=True)  # e.g. "CA1822", "SA1200", "RCS1005"
-    rule_name: Mapped[str] = mapped_column(String(128))  # e.g. "Member can be marked as static"
-    file_path: Mapped[str] = mapped_column(String(1024))
-    line_number: Mapped[int | None] = mapped_column()
-    column_number: Mapped[int | None] = mapped_column()
-    severity: Mapped[str] = mapped_column(String(16), index=True)  # Error / Warning / Info
-    category: Mapped[str | None] = mapped_column(String(64), index=True)  # Performance, Naming, etc.
-    message: Mapped[str] = mapped_column(Text)
-    snippet: Mapped[str | None] = mapped_column(Text)
-    scan_type: Mapped[str] = mapped_column(String(16), default="incremental")  # baseline / incremental
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    # relationships
-    event: Mapped["GithubEvent"] = relationship(back_populates="rule_results")
 
 
 class EvaluationRound(Base):
@@ -117,57 +79,3 @@ class EvaluationRound(Base):
 
     # relationships
     event: Mapped["GithubEvent"] = relationship(back_populates="evaluation_rounds")
-
-
-class Notification(Base):
-    """Outbound notification record for a completed evaluation.
-
-    The message content is built and persisted here.  Actual delivery to
-    external channels (WeCom / Feishu) is delegated to an independent
-    tool platform via the reserved ``POST /api/notifications/{id}/send-status``
-    callback.
-    """
-
-    __tablename__ = "notifications"
-    __table_args__ = (
-        Index("idx_notifications_event", "event_id"),
-        Index("idx_notifications_status", "status"),
-        Index("idx_notifications_channel", "channel"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    event_id: Mapped[int] = mapped_column(
-        ForeignKey("github_events.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    channel: Mapped[str] = mapped_column(String(32), default="generic")  # generic
-    trigger_reason: Mapped[str] = mapped_column(String(64))  # "critical", "high", "medium_low_score"
-    risk_level: Mapped[str | None] = mapped_column(String(16))
-    message_content: Mapped[str | None] = mapped_column(Text)  # rendered markdown / card JSON
-    webhook_url: Mapped[str | None] = mapped_column(String(1024))
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/sent/failed
-    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    error_message: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    # relationships
-    event: Mapped["GithubEvent"] = relationship(back_populates="notifications")
-
-
-class RepoScanConfig(Base):
-    """Per-repository scan configuration stored in DB for multi-repo support."""
-
-    __tablename__ = "repo_scan_configs"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    repository: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
-    analyze_paths: Mapped[list[str]] = mapped_column(JSON, default=list)  # e.g. ["Assets/Scripts"]
-    is_baseline_scanned: Mapped[bool] = mapped_column(Boolean, default=False)
-    baseline_scan_status: Mapped[str | None] = mapped_column(String(16))  # pending / running / done / failed
-    baseline_total_files: Mapped[int | None] = mapped_column()
-    baseline_total_issues: Mapped[int | None] = mapped_column()
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-    )

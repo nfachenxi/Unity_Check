@@ -162,6 +162,11 @@ onMounted(fetchEvents)
             <span class="rec-text">{{ (row.recommendation || '').replace('_', ' ') }}</span>
           </template>
         </el-table-column>
+        <el-table-column prop="executive_summary" label="AI 摘要" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="summary-text">{{ row.executive_summary || '-' }}</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="status" label="状态" width="85">
           <template #default="{ row }">
             <el-tag :type="getStatusType(row.status)" size="small" effect="plain">
@@ -229,6 +234,12 @@ onMounted(fetchEvents)
   color: var(--color-text-secondary);
   font-size: 12px;
   text-transform: capitalize;
+}
+
+.summary-text {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .time-text {

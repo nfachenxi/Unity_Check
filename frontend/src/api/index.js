@@ -27,17 +27,11 @@ export function getEventDetail(id) {
   return api.get(`/events/${id}`)
 }
 
-export function getEventRules(eventId, params) {
-  // Rules are now embedded in event detail via ?include=rules
-  return api.get(`/events/${eventId}`, { params: { ...params, include: 'rules' } })
-}
-
 export function getEventEvaluations(eventId) {
   return api.get(`/events/${eventId}/evaluations`)
 }
 
 export function getEventAssessment(eventId) {
-  // Assessment is now embedded in event detail via ?include=assessment
   return api.get(`/events/${eventId}`, { params: { include: 'assessment' } })
 }
 
@@ -48,11 +42,6 @@ export function getStatsScores(params) {
 
 export function getStatsHotspots(params) {
   return api.get('/dashboard', { params: { ...params, section: 'hotspots' } })
-}
-
-// ---- Notifications ----
-export function getNotifications(params) {
-  return api.get('/notifications', { params })
 }
 
 export default api

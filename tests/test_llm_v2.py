@@ -230,7 +230,6 @@ class TestEvaluateFileDimensionA:
         result = evaluate_file_dimension(
             file_path="Assets/Scripts/Player.cs",
             file_diff="+void Update() { GetComponent<Rigidbody>(); }",
-            file_rule_results=[],
             event_summary="push to main, commits=1",
             dimension="functionality_best_practices",
         )
@@ -251,7 +250,7 @@ class TestEvaluateFileDimensionA:
 
         result = evaluate_file_dimension(
             file_path="X.cs", file_diff="diff",
-            file_rule_results=[], event_summary="summary",
+            event_summary="summary",
             dimension="functionality_best_practices",
         )
         assert result["score"] == 0.0
@@ -269,7 +268,7 @@ class TestEvaluateFileDimensionA:
 
         result = evaluate_file_dimension(
             file_path="X.cs", file_diff="diff",
-            file_rule_results=[], event_summary="summary",
+            event_summary="summary",
             dimension="functionality_best_practices",
         )
         assert result["score"] == 0.0
@@ -289,7 +288,7 @@ class TestEvaluateFileDimensionA:
 
         result = evaluate_file_dimension(
             file_path="X.cs", file_diff="diff",
-            file_rule_results=[], event_summary="summary",
+            event_summary="summary",
             dimension="functionality_best_practices",
         )
         assert result["findings"] == []
@@ -328,7 +327,6 @@ class TestEvaluateFileDimensionB:
         result = evaluate_file_dimension(
             file_path="Assets/Scripts/Enemy.cs",
             file_diff="+void Update() { new List<int>(); }",
-            file_rule_results=[{"rule_id": "CA1822", "severity": "Warning"}],
             event_summary="pull_request #5, action=opened",
             dimension="security_performance_health",
         )
@@ -346,7 +344,7 @@ class TestEvaluateFileDimensionB:
 
         result = evaluate_file_dimension(
             file_path="X.cs", file_diff="diff",
-            file_rule_results=[], event_summary="summary",
+            event_summary="summary",
             dimension="security_performance_health",
         )
         assert result["score"] == 0.0
@@ -356,7 +354,7 @@ class TestEvaluateFileDimensionB:
         """Unknown dimension returns error."""
         result = evaluate_file_dimension(
             file_path="X.cs", file_diff="diff",
-            file_rule_results=[], event_summary="summary",
+            event_summary="summary",
             dimension="nonexistent_dimension",
         )
         assert result["score"] == 0.0

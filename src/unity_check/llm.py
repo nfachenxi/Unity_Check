@@ -47,8 +47,6 @@ PROMPT_TEMPLATES: dict[str, str] = {
         "GetComponent caching, proper [SerializeField]/[HideInInspector] usage, "
         "object pooling awareness, Scene/Asset management patterns.\n"
         "4. Naming convention adherence — fields, methods, classes follow Unity/C# standards.\n\n"
-        "**Do NOT re-report issues already caught by static analysis rules** "
-        "(those are listed in the RULE RESULTS section). Focus on deeper, semantic issues.\n\n"
         "Return **strict JSON**:\n"
         "{\n"
         '  "score": <float 0-100, where 100 = no functional/best-practice issues>,\n'
@@ -81,8 +79,6 @@ PROMPT_TEMPLATES: dict[str, str] = {
         "try-catch appropriate usage, logging quality.\n"
         "4. Code maintainability — method length, class responsibilities, magic numbers, "
         "hardcoded paths, configurable vs hardcoded values.\n\n"
-        "**Do NOT re-report issues already caught by static analysis rules** "
-        "(those are listed in the RULE RESULTS section). Focus on deeper, semantic issues.\n\n"
         "Return **strict JSON**:\n"
         "{\n"
         '  "score": <float 0-100, where 100 = no security/performance/health issues>,\n'
@@ -193,7 +189,6 @@ def _call_llm_with_retry(
 def evaluate_file_dimension(
     file_path: str,
     file_diff: str,
-    file_rule_results: list[dict[str, Any]],
     event_summary: str,
     dimension: str,
 ) -> dict[str, Any]:
@@ -205,8 +200,6 @@ def evaluate_file_dimension(
         The relative path of the file being evaluated.
     file_diff : str
         The git diff content specific to this file (may be truncated).
-    file_rule_results : list[dict]
-        Roslyn static-analysis rule results filtered to this file.
     event_summary : str
         Compact event description (push / PR context).
     dimension : str
@@ -246,12 +239,9 @@ def evaluate_file_dimension(
     if len(truncated) > MAX_DIFF_CHARS:
         truncated = truncated[:MAX_DIFF_CHARS] + "\n... [diff truncated]"
 
-    rules_json = json.dumps(file_rule_results, ensure_ascii=False, indent=2) if file_rule_results else "无静态规则违规"
-
     user_content = (
         f"=== 文件路径 ===\n{file_path}\n\n"
         f"=== 事件摘要 ===\n{event_summary}\n\n"
-        f"=== ROSLYN 规则结果 (本文件) ===\n{rules_json}\n\n"
         f"=== GIT DIFF (本文件) ===\n{truncated}\n"
     )
 

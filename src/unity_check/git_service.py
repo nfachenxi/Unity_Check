@@ -3,8 +3,6 @@
 import logging
 import os
 import re
-import threading
-from pathlib import Path
 from typing import Any
 
 from unity_check.config import get_settings
@@ -12,17 +10,6 @@ from unity_check.config import get_settings
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
-
-# Per-path locks to prevent concurrent fetch/clone on the same bare repo.
-_locks: dict[str, threading.Lock] = {}
-_locks_lock = threading.Lock()
-
-
-def _get_lock(path: str) -> threading.Lock:
-    with _locks_lock:
-        if path not in _locks:
-            _locks[path] = threading.Lock()
-        return _locks[path]
 
 
 class GitServiceError(Exception):
@@ -34,42 +21,13 @@ def _repo_name_from_url(clone_url: str) -> str:
 
     Example: 'git@github.com:owner/repo.git' -> 'owner_repo'
     """
-    # Strip protocol prefix, git@ prefix, and .git suffix
     cleaned = clone_url.strip()
     cleaned = re.sub(r"^https?://", "", cleaned)
     cleaned = re.sub(r"^git@", "", cleaned)
     cleaned = re.sub(r"\.git/*$", "", cleaned)
-    # Replace separators with underscore
     cleaned = re.sub(r"[/:@.]", "_", cleaned)
-    # Collapse repeated underscores
     cleaned = re.sub(r"_+", "_", cleaned)
     return cleaned.strip("_") or "unknown"
-
-
-def _ssh_command() -> str | None:
-    """Build GIT_SSH_COMMAND value when a key path is configured.
-
-    OpenSSH 10.0 removed StrictModes; StrictHostKeyChecking=accept-new
-    is passed via -o here.  Docker bind mounts on Windows enforce 0777
-    which OpenSSH rejects, so we copy the key to a writable path first.
-    """
-    key_path = settings.git_ssh_key_path.strip()
-    if not key_path:
-        return None
-    if not os.path.exists(key_path):
-        raise GitServiceError(f"SSH key not found: {key_path}")
-    # Copy key to a protected, writable location so OpenSSH accepts it.
-    safe_dir = os.path.expanduser("~/.ssh_keys")
-    os.makedirs(safe_dir, mode=0o700, exist_ok=True)
-    safe_key = os.path.join(safe_dir, "id_rsa")
-    if not os.path.exists(safe_key):
-        import shutil
-        shutil.copy2(key_path, safe_key)
-        os.chmod(safe_key, 0o600)
-    return (
-        f"ssh -i {safe_key} -o StrictHostKeyChecking=accept-new "
-        f"-o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null"
-    )
 
 
 def ensure_bare_repo(clone_url: str) -> str:
@@ -83,45 +41,35 @@ def ensure_bare_repo(clone_url: str) -> str:
     repo_dir = _repo_name_from_url(clone_url)
     bare_path = os.path.join(clone_base, f"{repo_dir}.git")
 
-    lock = _get_lock(bare_path)
-    with lock:
-        ssh_cmd = _ssh_command()
-        env = os.environ.copy()
-        if ssh_cmd:
-            env["GIT_SSH_COMMAND"] = ssh_cmd
-
-        if os.path.isdir(bare_path):
-            logger.info("Fetching existing bare repo: %s", bare_path)
+    if os.path.isdir(bare_path):
+        logger.info("Fetching existing bare repo: %s", bare_path)
+        try:
+            repo = git.Repo(bare_path)
             try:
-                repo = git.Repo(bare_path)
-                # GitPython 3.1.50 Remote.fetch_refspec raises AttributeError
-                # (not returns None).  Check via raw git-config instead.
-                try:
-                    has_refspec = bool(repo.git.config("--get", "remote.origin.fetch"))
-                except Exception:
-                    has_refspec = False
-                if not has_refspec:
-                    repo.git.remote("set-url", "origin", clone_url)
-                    repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
-                origin = repo.remote("origin")
-                origin.fetch(env=env)
-            except Exception as exc:
-                raise GitServiceError(
-                    f"Failed to fetch bare repo at {bare_path}: {exc}"
-                ) from exc
-        else:
-            logger.info("Cloning bare repo: %s -> %s", clone_url, bare_path)
-            try:
-                git.Repo.clone_from(
-                    clone_url,
-                    bare_path,
-                    bare=True,
-                    env=env,
-                )
-            except Exception as exc:
-                raise GitServiceError(
-                    f"Failed to clone bare repo from {clone_url}: {exc}"
-                ) from exc
+                has_refspec = bool(repo.git.config("--get", "remote.origin.fetch"))
+            except Exception:
+                has_refspec = False
+            if not has_refspec:
+                repo.git.remote("set-url", "origin", clone_url)
+                repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
+            origin = repo.remote("origin")
+            origin.fetch()
+        except Exception as exc:
+            raise GitServiceError(
+                f"Failed to fetch bare repo at {bare_path}: {exc}"
+            ) from exc
+    else:
+        logger.info("Cloning bare repo: %s -> %s", clone_url, bare_path)
+        try:
+            git.Repo.clone_from(
+                clone_url,
+                bare_path,
+                bare=True,
+            )
+        except Exception as exc:
+            raise GitServiceError(
+                f"Failed to clone bare repo from {clone_url}: {exc}"
+            ) from exc
 
     return bare_path
 
@@ -142,7 +90,6 @@ def get_diff(bare_repo_path: str, before_sha: str, after_sha: str) -> str:
     except Exception as exc:
         raise GitServiceError(f"Failed to open repo {bare_repo_path}: {exc}") from exc
 
-    # Guard: make sure the SHAs exist in the repo
     def _sha_exists(sha: str) -> bool:
         try:
             repo.commit(sha)
@@ -208,23 +155,21 @@ def extract_sha_from_payload(
 
 
 def extract_clone_url_from_payload(payload: dict[str, Any]) -> str | None:
-    """Extract the SSH clone URL from a GitHub webhook payload.
+    """Extract the clone URL from a GitHub webhook payload.
 
-    Prefers ssh_url; falls back to clone_url (https).
+    Prefers clone_url (https); falls back to ssh_url.
     """
     if not isinstance(payload, dict):
         return None
 
-    # push: repository is at top level
     if "repository" in payload:
         repo = payload["repository"] or {}
-        return repo.get("ssh_url") or repo.get("clone_url")
+        return repo.get("clone_url") or repo.get("ssh_url")
 
-    # pull_request: head repo may differ from base
     pr = payload.get("pull_request") or {}
     head = pr.get("head") or {}
     head_repo = head.get("repo") or {}
     if head_repo:
-        return head_repo.get("ssh_url") or head_repo.get("clone_url")
+        return head_repo.get("clone_url") or head_repo.get("ssh_url")
 
     return None

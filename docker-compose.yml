@@ -16,17 +16,6 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   api:
     build: .
     ports:
@@ -34,41 +23,13 @@ services:
     command: uv run uvicorn unity_check.main:app --app-dir src --host 0.0.0.0 --port 8000
     environment:
       - DATABASE_URL=postgresql+psycopg://unitycheck:unitycheck@db:5432/unitycheck
-      - REDIS_URL=redis://redis:6379/0
     volumes:
       - repos_data:/app/repos
-      - ./.ssh/id_rsa:/app/.ssh/id_rsa:ro
     env_file:
       - .env
     restart: unless-stopped
     depends_on:
       - db
-      - redis
-
-  worker:
-    build: .
-    command: uv run celery -A unity_check.celery_app:celery_app worker --loglevel=INFO
-    environment:
-      - DATABASE_URL=postgresql+psycopg://unitycheck:unitycheck@db:5432/unitycheck
-      - REDIS_URL=redis://redis:6379/0
-    volumes:
-      - repos_data:/app/repos
-      - ./.ssh/id_rsa:/app/.ssh/id_rsa:ro
-      - ./.ssh/known_hosts:/root/.ssh/known_hosts:ro
-    env_file:
-      - .env
-    restart: unless-stopped
-    depends_on:
-      - db
-      - redis
-
-  roslyn:
-    build:
-      context: ./roslyn-analyzer
-      dockerfile: Dockerfile
-    ports:
-      - "8080:8080"
-    restart: unless-stopped
 
 volumes:
   repos_data:

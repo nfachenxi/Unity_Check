@@ -1,12 +1,9 @@
 """Per-file evaluation orchestrator.
 
 For each .cs file in the diff:
-1. Aggregate Roslyn RuleResult → 1 rule_check EvaluationRound (round_number=0)
-2. For each file (round_number = file_index, 1..N):
-   a. Evaluate dimension A: functionality_best_practices → EvaluationRound
-   b. Evaluate dimension B: security_performance_health → EvaluationRound
-3. Programmatically aggregate all dimension results → update GithubEvent
-4. Trigger notification
+1. Extract .cs files from diff
+2. Per-file, per-dimension LLM evaluation (2 dimensions per file)
+3. Programmatically aggregate → update GithubEvent
 """
 
 from __future__ import annotations
@@ -15,12 +12,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from unity_check.llm import evaluate_file_dimension
-from unity_check.models import EvaluationRound, GithubEvent, RuleResult
-from unity_check.notification_service import build_and_persist_notifications
+from unity_check.models import EvaluationRound, GithubEvent
 from unity_check.rule_service import extract_cs_files_from_diff
 
 logger = logging.getLogger(__name__)
@@ -38,7 +33,7 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
 
     Side-effects
     ------------
-    * Inserts ``1 + N*2`` ``EvaluationRound`` rows (1 rule_check + N files × 2 dimensions).
+    * Inserts ``N*2`` ``EvaluationRound`` rows (N files × 2 dimensions).
     * Mutates *event* in-place: ``overall_score``, ``final_risk_level``,
       ``recommendation``, ``executive_summary``, ``dimension_a_score``,
       ``dimension_b_score``, ``dimension_a_summary``, ``dimension_b_summary``,
@@ -53,29 +48,11 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
     diff = (event.diff_content or "").strip()
     event_summary = _event_context(event)
 
-    # ---- Step 1: Rule results summary (programmatic, no LLM) -----------------
-    r1_start = datetime.now(timezone.utc)
-    r1_summary = _build_rule_results_summary(event_id, db)
-    r1_duration = int((datetime.now(timezone.utc) - r1_start).total_seconds() * 1000)
-    _persist_evaluation_round(
-        db,
-        event_id=event_id,
-        round_number=0,
-        round_type="rule_check",
-        status="success",
-        input_summary={"diff_size": len(diff), "event_summary": event_summary},
-        output_data=r1_summary,
-        tokens_used=0,
-        duration_ms=r1_duration,
-    )
-    logger.info("Rule check done for event_id=%s: %d violations", event_id, r1_summary.get("total", 0))
-
-    # ---- Step 2: Extract .cs files from diff --------------------------------
+    # ---- Step 1: Extract .cs files from diff --------------------------------
     cs_files = extract_cs_files_from_diff(diff) if diff else []
     if not cs_files:
         logger.info("No .cs files in diff for event_id=%s — using safe defaults", event_id)
         _set_safe_defaults(event, reason="no .cs files in diff")
-        build_and_persist_notifications(event, db)
         return {
             "status": event.status,
             "files_evaluated": 0,
@@ -84,20 +61,15 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
             "recommendation": event.recommendation,
         }
 
-    # ---- Step 3: Per-file, per-dimension LLM evaluation ---------------------
+    # ---- Step 2: Per-file, per-dimension LLM evaluation ---------------------
     all_dim_scores: dict[str, list[float]] = {"functionality_best_practices": [], "security_performance_health": []}
     all_dim_summaries: dict[str, list[str]] = {"functionality_best_practices": [], "security_performance_health": []}
     all_findings: list[dict[str, Any]] = []
     total_files_evaluated = 0
     rounds_completed = 0
 
-    per_file_rules = r1_summary.get("by_file", {})
-
     for file_idx, file_path in enumerate(cs_files, start=1):
-        # Extract file-specific diff
         file_diff = _extract_file_diff(diff, file_path)
-        # Get file-specific rule results
-        file_rules = per_file_rules.get(file_path, [])
 
         for dim in DIMENSIONS:
             start = datetime.now(timezone.utc)
@@ -105,7 +77,6 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
                 result = evaluate_file_dimension(
                     file_path=file_path,
                     file_diff=file_diff,
-                    file_rule_results=file_rules,
                     event_summary=event_summary,
                     dimension=dim,
                 )
@@ -153,11 +124,8 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
 
         total_files_evaluated += 1
 
-    # ---- Step 4: Programmatic aggregation -----------------------------------
+    # ---- Step 3: Programmatic aggregation -----------------------------------
     _aggregate_and_update_event(event, all_dim_scores, all_dim_summaries, all_findings, cs_files)
-
-    # ---- Step 5: Notification -----------------------------------------------
-    build_and_persist_notifications(event, db)
 
     return {
         "status": event.status,
@@ -276,65 +244,6 @@ def _event_context(event: GithubEvent) -> str:
         title = pr.get("title", "")
         return f"pull_request #{pr_number}, action={event.action or 'unknown'}, title={title}"
     return f"event={event.event_type}, action={event.action or 'none'}"
-
-
-def _build_rule_results_summary(event_id: int, db: Session) -> dict[str, Any]:
-    """Aggregate ``RuleResult`` rows for *event_id* into a summary dict.
-
-    Includes per-file breakdown for filtering rule results to individual files.
-    """
-    rows = db.scalars(
-        select(RuleResult).where(RuleResult.event_id == event_id)
-    ).all()
-
-    if not rows:
-        return {
-            "total": 0,
-            "by_severity": {},
-            "by_category": {},
-            "top_rules": [],
-            "top_files": [],
-            "by_file": {},
-        }
-
-    severity_counts: dict[str, int] = {}
-    category_counts: dict[str, int] = {}
-    rule_counts: dict[str, int] = {}
-    file_counts: dict[str, int] = {}
-    by_file: dict[str, list[dict[str, Any]]] = {}
-
-    for r in rows:
-        sev = r.severity.lower()
-        severity_counts[sev] = severity_counts.get(sev, 0) + 1
-        cat = (r.category or "uncategorized").lower()
-        category_counts[cat] = category_counts.get(cat, 0) + 1
-        key = f"{r.rule_id}: {r.rule_name}"
-        rule_counts[key] = rule_counts.get(key, 0) + 1
-        file_counts[r.file_path] = file_counts.get(r.file_path, 0) + 1
-
-        # Per-file detail for LLM context
-        if r.file_path not in by_file:
-            by_file[r.file_path] = []
-        by_file[r.file_path].append({
-            "rule_id": r.rule_id,
-            "rule_name": r.rule_name,
-            "severity": r.severity,
-            "category": r.category,
-            "message": r.message,
-            "line_number": r.line_number,
-        })
-
-    top_rules = sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-
-    return {
-        "total": len(rows),
-        "by_severity": severity_counts,
-        "by_category": category_counts,
-        "top_rules": [{"rule": k, "count": v} for k, v in top_rules],
-        "top_files": [{"file": k, "count": v} for k, v in top_files],
-        "by_file": by_file,
-    }
 
 
 def _extract_file_diff(full_diff: str, file_path: str) -> str:

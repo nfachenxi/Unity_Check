@@ -2,9 +2,8 @@
 
 import pytest
 
-from unity_check.models import EvaluationRound, GithubEvent, RuleResult
+from unity_check.models import EvaluationRound, GithubEvent
 from unity_check.orchestrator import (
-    _build_rule_results_summary,
     _event_context,
     _extract_file_diff,
     _persist_evaluation_round,
@@ -67,72 +66,6 @@ class TestExtractFileDiff:
 
 
 # ---------------------------------------------------------------------------
-# _build_rule_results_summary
-# ---------------------------------------------------------------------------
-class TestBuildRuleResultsSummary:
-    def test_empty_when_no_rules(self, session):
-        event = GithubEvent(
-            delivery_id="orc-summary-empty",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-
-        summary = _build_rule_results_summary(event.id, session)
-        assert summary["total"] == 0
-        assert summary["by_severity"] == {}
-        assert summary["by_category"] == {}
-        assert summary["top_rules"] == []
-        assert summary["top_files"] == []
-        assert summary["by_file"] == {}
-
-    def test_aggregates_rules(self, session):
-        event = GithubEvent(
-            delivery_id="orc-summary-data",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        session.add_all([
-            RuleResult(
-                event_id=event_id, rule_id="R1", rule_name="Rule One",
-                file_path="A.cs", severity="Warning", category="Perf",
-                message="m", scan_type="incremental",
-            ),
-            RuleResult(
-                event_id=event_id, rule_id="R1", rule_name="Rule One",
-                file_path="B.cs", severity="Warning", category="Perf",
-                message="m", scan_type="incremental",
-            ),
-            RuleResult(
-                event_id=event_id, rule_id="R2", rule_name="Rule Two",
-                file_path="A.cs", severity="Error", category="Naming",
-                message="m", scan_type="incremental",
-            ),
-        ])
-        session.commit()
-
-        summary = _build_rule_results_summary(event_id, session)
-        assert summary["total"] == 3
-        assert summary["by_severity"] == {"warning": 2, "error": 1}
-        assert "perf" in summary["by_category"]
-        assert "naming" in summary["by_category"]
-        assert len(summary["top_rules"]) == 2
-        assert len(summary["top_files"]) >= 1
-        # Per-file breakdown
-        assert "A.cs" in summary["by_file"]
-        assert len(summary["by_file"]["A.cs"]) == 2
-        assert "B.cs" in summary["by_file"]
-        assert len(summary["by_file"]["B.cs"]) == 1
-
-
-# ---------------------------------------------------------------------------
 # _persist_evaluation_round
 # ---------------------------------------------------------------------------
 class TestPersistEvaluationRound:
@@ -149,8 +82,9 @@ class TestPersistEvaluationRound:
         er = _persist_evaluation_round(
             db=session,
             event_id=event.id,
-            round_number=0,
-            round_type="rule_check",
+            round_number=1,
+            round_type="functionality_best_practices",
+            file_path="A.cs",
             status="success",
             input_summary={"k": "v"},
             output_data={"total": 5},
@@ -158,7 +92,7 @@ class TestPersistEvaluationRound:
             duration_ms=50,
         )
         assert er.id is not None
-        assert er.round_number == 0
+        assert er.round_number == 1
         assert er.status == "success"
 
         rows = session.query(EvaluationRound).filter_by(event_id=event.id).all()
@@ -233,14 +167,12 @@ class TestRunEvaluationPipeline:
         assert reloaded.final_risk_level == "unknown"
         assert "no .cs files" in (reloaded.executive_summary or "")
 
-        # Should have 1 rule_check round (round 0, with total=0)
+        # Should have 0 rounds (no rule_check)
         rounds = session.query(EvaluationRound).filter_by(event_id=event.id).all()
-        assert len(rounds) == 1
-        assert rounds[0].round_type == "rule_check"
-        assert rounds[0].round_number == 0
+        assert len(rounds) == 0
 
     def test_single_cs_file_produces_two_dimensions(self, session):
-        """1 .cs file → 3 rounds: 1 rule_check + 2 dimensions."""
+        """1 .cs file → 2 rounds: function + security dimensions (no rule_check)."""
         diff = (
             "diff --git a/Assets/Scripts/Player.cs b/Assets/Scripts/Player.cs\n"
             "+void Update() {\n"
@@ -268,14 +200,12 @@ class TestRunEvaluationPipeline:
             .order_by(EvaluationRound.round_number, EvaluationRound.id)
             .all()
         )
-        rule_check = [r for r in rounds if r.round_type == "rule_check"]
         dim_a = [r for r in rounds if r.round_type == "functionality_best_practices"]
         dim_b = [r for r in rounds if r.round_type == "security_performance_health"]
 
-        assert len(rule_check) == 1
-        assert rule_check[0].round_number == 0
         assert len(dim_a) == 1
         assert len(dim_b) == 1
+        # Round numbers start at 1
         assert dim_a[0].round_number == 1
         assert dim_b[0].round_number == 1
         assert dim_a[0].file_path == "Assets/Scripts/Player.cs"

@@ -1,7 +1,6 @@
-"""Tests for webhook parsing and event endpoints (v2 simplified)."""
+"""Tests for webhook parsing and event endpoints (simplified)."""
 
 import json
-from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -9,28 +8,23 @@ from fastapi.testclient import TestClient
 
 from unity_check.db import get_db
 from unity_check.main import app
-from unity_check.models import EvaluationRound, GithubEvent, RuleResult
-
-
-def _fake_task_id() -> str:
-    return str(uuid4())
+from unity_check.models import EvaluationRound, GithubEvent
 
 
 @pytest.fixture(autouse=True)
 def _override_dependencies(monkeypatch, session):
-    """Override FastAPI dependencies and Celery tasks for testing."""
+    """Override FastAPI dependencies for testing."""
     app.dependency_overrides[get_db] = lambda: session
 
-    class _FakeAsyncResult:
-        def __init__(self, event_id):
-            self.id = _fake_task_id()
-            self.event_id = event_id
+    # Mock git operations so webhook doesn't try real clone/fetch
+    def fake_ensure_bare_repo(clone_url):
+        return "/fake/path.git"
 
-    def _fake_delay(event_id):
-        return _FakeAsyncResult(event_id)
+    def fake_get_diff(bare_repo_path, before_sha, after_sha):
+        return "diff --git a/A.cs b/A.cs\n+code\n"
 
-    monkeypatch.setattr("unity_check.main.process_github_event.delay", _fake_delay)
-    monkeypatch.setattr("unity_check.tasks.SessionLocal", lambda: session)
+    monkeypatch.setattr("unity_check.main.ensure_bare_repo", fake_ensure_bare_repo)
+    monkeypatch.setattr("unity_check.main.get_diff", fake_get_diff)
 
     yield
     app.dependency_overrides.clear()
@@ -77,7 +71,7 @@ class TestWebhookPush:
             "ref": "refs/heads/main",
             "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "repository": {"full_name": "test/repo"},
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
         }
 
     @staticmethod
@@ -89,12 +83,15 @@ class TestWebhookPush:
                 "number": 42,
                 "title": "Test PR",
                 "base": {"sha": "base-sha-40-chars-base-sha-40-charsss"},
-                "head": {"sha": "head-sha-40-chars-head-sha-40-charsss"},
+                "head": {
+                    "sha": "head-sha-40-chars-head-sha-40-charsss",
+                    "repo": {"clone_url": "https://github.com/test/repo.git"},
+                },
             },
-            "repository": {"full_name": "test/repo"},
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
         }
 
-    def test_push_returns_202(self, client, session):
+    def test_push_returns_200(self, client, session):
         resp = client.post(
             "/webhook/github",
             headers={
@@ -103,13 +100,12 @@ class TestWebhookPush:
             },
             content=json.dumps(self._valid_push_payload()).encode(),
         )
-        assert resp.status_code == 202
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
+        assert data["status"] == "success"
         assert "event_id" in data
-        assert "task_id" in data
 
-    def test_pull_request_returns_202(self, client, session):
+    def test_pull_request_returns_200(self, client, session):
         resp = client.post(
             "/webhook/github",
             headers={
@@ -118,9 +114,9 @@ class TestWebhookPush:
             },
             content=json.dumps(self._valid_pr_payload()).encode(),
         )
-        assert resp.status_code == 202
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
+        assert data["status"] == "success"
 
     def test_events_persisted_to_db(self, client, session):
         resp = client.post(
@@ -131,10 +127,9 @@ class TestWebhookPush:
             },
             content=json.dumps(self._valid_push_payload()).encode(),
         )
-        assert resp.status_code == 202
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
-        # Verify event is queryable via /api/events
+        assert data["status"] == "success"
         events_resp = client.get("/api/events").json()
         ids = [e["id"] for e in events_resp["items"]]
         assert int(data["event_id"]) in ids
@@ -148,7 +143,7 @@ class TestWebhookPush:
             },
             content=json.dumps(self._valid_push_payload()).encode(),
         )
-        assert resp.status_code == 202
+        assert resp.status_code == 200
         event_id = resp.json()["event_id"]
         detail = client.get(f"/api/events/{event_id}").json()
         assert detail["after_sha"] == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -163,7 +158,7 @@ class TestWebhookPush:
             },
             content=json.dumps(self._valid_pr_payload()).encode(),
         )
-        assert resp.status_code == 202
+        assert resp.status_code == 200
         event_id = resp.json()["event_id"]
         detail = client.get(f"/api/events/{event_id}").json()
         assert detail["before_sha"] == "base-sha-40-chars-base-sha-40-charsss"
@@ -176,10 +171,10 @@ class TestWebhookPush:
         }
         body = json.dumps(self._valid_push_payload()).encode()
         r1 = client.post("/webhook/github", headers=headers, content=body)
-        assert r1.status_code == 202
+        assert r1.status_code == 200
         session.flush()
         r2 = client.post("/webhook/github", headers=headers, content=body)
-        assert r2.status_code == 202
+        assert r2.status_code == 200
         assert r2.json()["event_id"] == r1.json()["event_id"]
 
 
@@ -203,37 +198,28 @@ class TestWebhookValidation:
         )
         assert resp.status_code == 400
 
-    def test_signature_fails_when_secret_configured(self, client, monkeypatch):
-        monkeypatch.setattr("unity_check.main.settings.github_webhook_secret", "test-secret")
-        resp = client.post(
-            "/webhook/github",
-            headers={
-                "X-GitHub-Event": "push",
-                "X-GitHub-Delivery": "delivery-sig-001",
-                "X-Hub-Signature-256": "sha256=invalid",
-            },
-            content=json.dumps({"repository": {"full_name": "test/repo"}}).encode(),
-        )
-        assert resp.status_code == 401
-
 
 class TestEventDetail:
-    def test_returns_full_event(self, client, session):
+    def _make_push_event(self, client):
+        payload = {
+            "ref": "refs/heads/main",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
+        }
         resp = client.post(
             "/webhook/github",
             headers={
                 "X-GitHub-Event": "push",
-                "X-GitHub-Delivery": "delivery-detail-001",
+                "X-GitHub-Delivery": f"delivery-detail-{uuid4().hex[:8]}",
             },
-            content=json.dumps({
-                "ref": "refs/heads/main",
-                "before": "a" * 40,
-                "after": "b" * 40,
-                "repository": {"full_name": "test/repo"},
-            }).encode(),
+            content=json.dumps(payload).encode(),
         )
-        assert resp.status_code == 202
-        event_id = resp.json()["event_id"]
+        assert resp.status_code == 200
+        return resp.json()["event_id"]
+
+    def test_returns_full_event(self, client, session):
+        event_id = self._make_push_event(client)
         detail = client.get(f"/api/events/{event_id}").json()
         assert detail["id"] == int(event_id)
         assert detail["event_type"] == "push"
@@ -243,30 +229,6 @@ class TestEventDetail:
         assert "dimension_b_score" in detail
         assert "final_risk_level" in detail
         assert "updated_at" in detail
-
-    def test_includes_rules_when_requested(self, client, session):
-        event = GithubEvent(
-            delivery_id="rules-include",
-            event_type="push",
-            payload={},
-            status="success",
-        )
-        session.add(event)
-        session.commit()
-        event_id = event.id
-
-        session.add(RuleResult(
-            event_id=event_id, rule_id="R1", rule_name="Rule One",
-            file_path="A.cs", severity="Warning", category="Perf",
-            message="m", scan_type="incremental",
-        ))
-        session.commit()
-
-        resp = client.get(f"/api/events/{event_id}?include=rules")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "rules" in data
-        assert len(data["rules"]) == 1
 
     def test_includes_assessment_when_requested(self, client, session):
         event = GithubEvent(
@@ -280,8 +242,8 @@ class TestEventDetail:
         event_id = event.id
 
         session.add(EvaluationRound(
-            event_id=event_id, round_number=0, round_type="rule_check",
-            status="success", input_summary={}, output_data={"total": 0},
+            event_id=event_id, round_number=1, round_type="functionality_best_practices",
+            file_path="A.cs", status="success", input_summary={}, output_data={"total": 0},
         ))
         session.commit()
 
@@ -294,49 +256,3 @@ class TestEventDetail:
     def test_nonexistent_event_returns_404(self, client):
         resp = client.get("/api/events/99999")
         assert resp.status_code == 404
-
-
-class TestRepoConfig:
-    def test_get_default_config(self, client, monkeypatch):
-        from unity_check.config import get_settings
-
-        monkeypatch.setattr(
-            get_settings(), "default_analyze_paths", "Default/Path"
-        )
-        resp = client.get("/repos/test-default/config")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["repository"] == "test-default"
-        assert data["analyze_paths"] == ["Default/Path"]
-        assert data["is_baseline_scanned"] is False
-
-    def test_put_and_get_config(self, client, session):
-        resp = client.put(
-            "/repos/test-put/config",
-            json={
-                "repository": "test-put",
-                "analyze_paths": ["Custom/Scripts", "Custom/Editor"],
-            },
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "Custom/Scripts" in data["analyze_paths"]
-        assert "Custom/Editor" in data["analyze_paths"]
-
-        resp2 = client.get("/repos/test-put/config")
-        assert resp2.status_code == 200
-        assert "Custom/Scripts" in resp2.json()["analyze_paths"]
-
-    def test_put_updates_existing(self, client, session):
-        client.put(
-            "/repos/test-update/config",
-            json={"analyze_paths": ["Path1"]},
-        )
-        resp = client.put(
-            "/repos/test-update/config",
-            json={"analyze_paths": ["Path2"], "is_baseline_scanned": True},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["analyze_paths"] == ["Path2"]
-        assert data["is_baseline_scanned"] is True

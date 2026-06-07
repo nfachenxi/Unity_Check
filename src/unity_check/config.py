@@ -14,22 +14,12 @@ class Settings(BaseSettings):
     app_log_level: str = Field(default="INFO", alias="APP_LOG_LEVEL")
 
     database_url: str = Field(alias="DATABASE_URL")
-    redis_url: str = Field(alias="REDIS_URL")
-    github_webhook_secret: str = Field(default="", alias="GITHUB_WEBHOOK_SECRET")
-    github_remote_repo: str = Field(alias="GITHUB_REMOTE_REPO")
 
     llm_base_url: str = Field(default="https://api.deepseek.com", alias="LLM_BASE_URL")
     llm_model: str = Field(default="deepseek-chat", alias="LLM_MODEL")
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
 
-    git_ssh_key_path: str = Field(default="", alias="GIT_SSH_KEY_PATH")
-
-    roslyn_service_url: str = Field(default="http://roslyn:8080", alias="ROSLYN_SERVICE_URL")
-    default_analyze_paths: str = Field(default="Assets/Scripts", alias="DEFAULT_ANALYZE_PATHS")
-
     git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
-
-    notify_score_threshold: float = Field(default=70.0, alias="NOTIFY_SCORE_THRESHOLD")
 
 
 @lru_cache()

@@ -1,12 +1,11 @@
 <script setup>
 import { ref, onMounted, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getEventDetail, getEventRules, getEventEvaluations, getEventAssessment } from '../api/index.js'
+import { getEventDetail, getEventEvaluations, getEventAssessment } from '../api/index.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 const loading = ref(true)
 const event = ref(null)
-const rules = ref([])
 const evaluations = ref([])
 const assessment = ref(null)
 const activeTab = ref('dim-a')
@@ -14,15 +13,12 @@ const activeTab = ref('dim-a')
 async function fetchData() {
   try {
     const id = parseInt(props.id, 10)
-    const [evtRes, rulesRes, evalRes, assessRes] = await Promise.all([
+    const [evtRes, evalRes, assessRes] = await Promise.all([
       getEventDetail(id),
-      getEventRules(id, { limit: 500 }),
       getEventEvaluations(id),
       getEventAssessment(id),
     ])
     event.value = evtRes.data
-    // Rules & assessment now embedded via ?include=rules / ?include=assessment
-    rules.value = rulesRes.data?.rules || []
     evaluations.value = evalRes.data || []
     assessment.value = assessRes.data?.assessment || assessRes.data
   } catch (e) {
@@ -34,7 +30,7 @@ async function fetchData() {
 
 // Filter evaluation rounds by type
 const ruleCheckRound = computed(() =>
-  evaluations.value.find(r => r.round_type === 'rule_check')
+  null
 )
 const dimARounds = computed(() =>
   evaluations.value.filter(r => r.round_type === 'functionality_best_practices')
@@ -131,31 +127,6 @@ onMounted(fetchData)
     <!-- Tabs -->
     <div class="dashboard-card" style="margin-top: 16px;">
       <el-tabs v-model="activeTab" type="border-card">
-        <!-- Rules Tab (Roslyn) -->
-        <el-tab-pane label="规则检测" name="rules">
-          <div class="round-header">
-            <span class="round-badge">共 {{ rules.length }} 条违规</span>
-          </div>
-          <el-table :data="rules" size="small" max-height="400" style="width:100%">
-            <el-table-column prop="rule_id" label="规则" width="110" />
-            <el-table-column prop="severity" label="严重度" width="80">
-              <template #default="{ row }">
-                <el-tag :type="row.severity === 'Error' ? 'danger' : row.severity === 'Warning' ? 'warning' : 'info'" size="small" effect="dark">
-                  {{ row.severity }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="category" label="类别" width="100" />
-            <el-table-column prop="file_path" label="文件" min-width="150">
-              <template #default="{ row }">
-                <code class="file-path">{{ row.file_path }}</code>
-              </template>
-            </el-table-column>
-            <el-table-column prop="line_number" label="行" width="50" align="center" />
-            <el-table-column prop="message" label="描述" min-width="250" show-overflow-tooltip />
-          </el-table>
-        </el-tab-pane>
-
         <!-- Dimension A Tab -->
         <el-tab-pane label="维度A · 功能与最佳实践" name="dim-a">
           <div class="round-header">

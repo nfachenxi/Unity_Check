@@ -111,7 +111,8 @@ class TestExtractCloneUrl:
             }
         }
         url = extract_clone_url_from_payload(payload)
-        assert url == "git@github.com:owner/repo.git"
+        # clone_url (HTTPS) preferred over ssh_url in simplified version
+        assert url == "https://github.com/owner/repo.git"
 
     def test_push_https_fallback(self):
         payload = {
@@ -142,7 +143,8 @@ class TestExtractCloneUrl:
             }
         }
         url = extract_clone_url_from_payload(payload)
-        assert url == "git@github.com:fork/repo.git"
+        # clone_url (HTTPS) preferred over ssh_url in simplified version
+        assert url == "https://github.com/fork/repo.git"
 
     def test_pr_head_repo_fallback(self):
         payload = {
@@ -256,8 +258,6 @@ class TestEnsureBareRepo:
         # Override CLONE_BASE_DIR
         clone_base = tmp_path / "clones"
         monkeypatch.setattr("unity_check.git_service.settings.git_clone_base_dir", str(clone_base))
-        # Clear SSH key path so we don't try to use SSH
-        monkeypatch.setattr("unity_check.git_service.settings.git_ssh_key_path", "")
 
         path = ensure_bare_repo(str(src))
         assert os.path.isdir(path)
@@ -270,7 +270,6 @@ class TestEnsureBareRepo:
 
         clone_base = tmp_path / "clones"
         monkeypatch.setattr("unity_check.git_service.settings.git_clone_base_dir", str(clone_base))
-        monkeypatch.setattr("unity_check.git_service.settings.git_ssh_key_path", "")
 
         # First call clones — succeeds
         path1 = ensure_bare_repo(str(src))
@@ -286,15 +285,9 @@ class TestEnsureBareRepo:
             # Acceptable: local clones lack fetch refspec by default
             pass
 
-    def test_missing_ssh_key_raises_when_configured(self, tmp_path, monkeypatch):
-        """When GIT_SSH_KEY_PATH points to a non-existent file, GitServiceError is raised."""
-        src = tmp_path / "source.git"
-        subprocess.run(["git", "init", "--bare", str(src)], check=True, capture_output=True)
-
+    def test_ensure_bare_repo_handles_nonexistent_repo(self, tmp_path, monkeypatch):
+        """When the clone URL points to a non-existent path, GitServiceError is raised."""
         clone_base = tmp_path / "clones"
         monkeypatch.setattr("unity_check.git_service.settings.git_clone_base_dir", str(clone_base))
-        monkeypatch.setattr(
-            "unity_check.git_service.settings.git_ssh_key_path", "/nonexistent/ssh_key"
-        )
-        with pytest.raises(GitServiceError, match="SSH key not found"):
-            ensure_bare_repo(str(src))
+        with pytest.raises(GitServiceError):
+            ensure_bare_repo("/nonexistent/path/repo.git")

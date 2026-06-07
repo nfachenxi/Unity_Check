@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -11,14 +9,15 @@ from sqlalchemy.orm import Session
 
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db
-from unity_check.git_service import extract_sha_from_payload
-from unity_check.models import EvaluationRound, GithubEvent, Notification, RepoScanConfig, RuleResult
-from unity_check.rule_service import (
-    ensure_repo_scan_config,
-    get_analyze_paths,
-    is_baseline_needed,
+from unity_check.git_service import (
+    GitServiceError,
+    ensure_bare_repo,
+    extract_clone_url_from_payload,
+    extract_sha_from_payload,
+    get_diff,
 )
-from unity_check.tasks import process_github_event, run_baseline_scan_task
+from unity_check.models import EvaluationRound, GithubEvent
+from unity_check.orchestrator import run_evaluation_pipeline
 
 settings = get_settings()
 
@@ -39,46 +38,31 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
-def verify_github_signature(payload_bytes: bytes, signature_header: str | None) -> bool:
-    # Allow local debug traffic when no secret is configured.
-    if not settings.github_webhook_secret:
-        return True
-    if not signature_header or not signature_header.startswith("sha256="):
-        return False
-    expected = hmac.new(
-        settings.github_webhook_secret.encode("utf-8"),
-        msg=payload_bytes,
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    provided = signature_header.split("=", maxsplit=1)[1]
-    return hmac.compare_digest(expected, provided)
-
-
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)) -> dict[str, str]:
     db.execute(text("SELECT 1"))
     return {"status": "ok"}
 
 
-@app.post("/webhook/github", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/webhook/github")
 async def receive_github_webhook(
     request: Request,
     x_github_event: str = Header(default="", alias="X-GitHub-Event"),
     x_github_delivery: str | None = Header(default=None, alias="X-GitHub-Delivery"),
-    x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
+):
+    """Receive a GitHub webhook and process synchronously.
+
+    Clones/fetches the repo, extracts the diff, runs the per-file LLM
+    evaluation pipeline, and returns the result inline.
+    """
     event_type = x_github_event.strip()
     payload_bytes = await request.body()
-
-    if not verify_github_signature(payload_bytes, x_hub_signature_256):
-        raise HTTPException(status_code=401, detail="Invalid signature.")
 
     if event_type == "ping":
         logger.info("Ping event received (delivery=%s)", x_github_delivery)
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
-    # Only handle the two event types included in phase-1 scope.
     if event_type not in {"push", "pull_request"}:
         raise HTTPException(status_code=400, detail="Only push and pull_request are supported.")
 
@@ -87,17 +71,15 @@ async def receive_github_webhook(
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
 
+    # Idempotency check via delivery_id
     existed = None
-    # Delivery ID is used as an idempotency key for duplicate retries.
     if x_github_delivery:
         existed = db.scalar(select(GithubEvent).where(GithubEvent.delivery_id == x_github_delivery))
     if existed is not None:
-        return {"status": "accepted", "event_id": str(existed.id), "task_id": existed.task_id or ""}
+        return {"status": "accepted", "event_id": str(existed.id)}
 
     repository = ((payload.get("repository") or {}).get("full_name")) if isinstance(payload, dict) else None
     action = payload.get("action") if isinstance(payload, dict) else None
-
-    # Extract before/after SHA from payload for git diff operations.
     before_sha, after_sha = extract_sha_from_payload(payload, event_type)
 
     event = GithubEvent(
@@ -108,19 +90,36 @@ async def receive_github_webhook(
         before_sha=before_sha,
         after_sha=after_sha,
         payload=payload,
-        status="queued",
+        status="running",
     )
     db.add(event)
-    db.commit()
-    db.refresh(event)
+    db.flush()
 
-    # Push heavy evaluation work to worker; API returns immediately.
-    task = process_github_event.delay(event.id)
-    event.task_id = task.id
-    db.commit()
+    # --- Synchronous processing ---
+    try:
+        clone_url = extract_clone_url_from_payload(payload)
+        if clone_url and after_sha:
+            bare_path = ensure_bare_repo(clone_url)
+            event.clone_path = bare_path
+            diff = get_diff(bare_path, before_sha or "", after_sha)
+            event.diff_content = diff
+            event.diff_size = len(diff.encode("utf-8")) if diff else 0
 
-    logger.info("Webhook accepted: id=%s event=%s task=%s", event.id, event.event_type, task.id)
-    return {"status": "accepted", "event_id": str(event.id), "task_id": task.id}
+        run_evaluation_pipeline(event, db)
+        db.commit()
+        return {"status": "success", "event_id": str(event.id)}
+    except GitServiceError as exc:
+        logger.exception("Git workflow failed for event %s", event.id)
+        event.status = "failed"
+        event.error_message = str(exc)
+        db.commit()
+        return {"status": "failed", "event_id": str(event.id), "error": str(exc)}
+    except Exception as exc:
+        logger.exception("Sync processing failed for event %s", event.id)
+        event.status = "failed"
+        event.error_message = str(exc)
+        db.commit()
+        return {"status": "failed", "event_id": str(event.id), "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +191,6 @@ def get_events_paginated(
             "final_risk_level": item.final_risk_level,
             "recommendation": item.recommendation,
             "executive_summary": item.executive_summary,
-            "task_id": item.task_id,
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         }
@@ -214,10 +212,10 @@ def get_event_detail(
     include: str | None = None,
     db: Session = Depends(get_db),
 ) -> dict:
-    """Return event detail, optionally including rules and assessment.
+    """Return event detail, optionally including assessment.
 
     Query params:
-        include: comma-separated list — "rules", "assessment", or "rules,assessment"
+        include: "assessment" to include evaluation rounds data
     """
     event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
     if event is None:
@@ -244,36 +242,11 @@ def get_event_detail(
         "dimension_a_summary": event.dimension_a_summary,
         "dimension_b_summary": event.dimension_b_summary,
         "error_message": event.error_message,
-        "task_id": event.task_id,
         "created_at": event.created_at.isoformat() if event.created_at else None,
         "updated_at": event.updated_at.isoformat() if event.updated_at else None,
     }
 
     includes = set((include or "").lower().split(","))
-
-    if "rules" in includes:
-        rules = db.scalars(
-            select(RuleResult)
-            .where(RuleResult.event_id == event_id)
-            .order_by(RuleResult.severity.desc(), RuleResult.file_path, RuleResult.line_number)
-        ).all()
-        result["rules"] = [
-            {
-                "id": r.id,
-                "rule_id": r.rule_id,
-                "rule_name": r.rule_name,
-                "file_path": r.file_path,
-                "line_number": r.line_number,
-                "column_number": r.column_number,
-                "severity": r.severity,
-                "category": r.category,
-                "message": r.message,
-                "snippet": r.snippet,
-                "scan_type": r.scan_type,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in rules
-        ]
 
     if "assessment" in includes:
         rounds = db.scalars(
@@ -308,136 +281,6 @@ def get_event_detail(
         }
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Repository scan configuration
-# ---------------------------------------------------------------------------
-
-def _repo_name_from_path(repo: str) -> str:
-    """Normalise a URL-encoded or raw repository name for lookup."""
-    return repo.strip().lower()
-
-
-@app.get("/repos/{repo_name}/config")
-def get_repo_config(
-    repo_name: str,
-    db: Session = Depends(get_db),
-) -> dict:
-    """Return scan configuration for a repository."""
-    name = _repo_name_from_path(repo_name)
-    config = db.scalar(
-        select(RepoScanConfig).where(RepoScanConfig.repository == name)
-    )
-    if config is None:
-        # Return default config without creating it.
-        return {
-            "repository": name,
-            "analyze_paths": get_analyze_paths(name, db),
-            "is_baseline_scanned": False,
-            "baseline_scan_status": None,
-            "baseline_total_files": None,
-            "baseline_total_issues": None,
-        }
-    return {
-        "repository": config.repository,
-        "analyze_paths": config.analyze_paths,
-        "is_baseline_scanned": config.is_baseline_scanned,
-        "baseline_scan_status": config.baseline_scan_status,
-        "baseline_total_files": config.baseline_total_files,
-        "baseline_total_issues": config.baseline_total_issues,
-    }
-
-
-@app.put("/repos/{repo_name}/config")
-def update_repo_config(
-    repo_name: str,
-    body: dict,
-    db: Session = Depends(get_db),
-) -> dict:
-    """Create or update scan configuration for a repository.
-
-    Request body (all fields optional):
-    {
-        "repository": "owner/repo",
-        "analyze_paths": ["Assets/Scripts", "Assets/Editor"],
-        "is_baseline_scanned": false
-    }
-    """
-    name = _repo_name_from_path(repo_name)
-    config = ensure_repo_scan_config(name, db)
-
-    if "repository" in body and body["repository"]:
-        config.repository = str(body["repository"])
-    if "analyze_paths" in body and isinstance(body["analyze_paths"], list):
-        config.analyze_paths = [str(p) for p in body["analyze_paths"]]
-    if "is_baseline_scanned" in body:
-        config.is_baseline_scanned = bool(body["is_baseline_scanned"])
-
-    db.flush()
-    return {
-        "repository": config.repository,
-        "analyze_paths": config.analyze_paths,
-        "is_baseline_scanned": config.is_baseline_scanned,
-        "baseline_scan_status": config.baseline_scan_status,
-        "message": "Configuration updated.",
-    }
-
-
-@app.post("/repos/{repo_name}/baseline-scan")
-def trigger_baseline_scan(
-    repo_name: str,
-    db: Session = Depends(get_db),
-) -> dict:
-    """Manually trigger a baseline scan for a repository.
-
-    Returns immediately with a Celery task_id; the scan runs async.
-    """
-    name = _repo_name_from_path(repo_name)
-    config = ensure_repo_scan_config(name, db)
-
-    if config.baseline_scan_status == "running":
-        return {
-            "status": "conflict",
-            "message": "A baseline scan is already running for this repository.",
-        }
-
-    # We need the repo's local path.  Since this is a manual trigger, use the
-    # configured git_clone_base_dir + repo name to locate it.
-    import os
-    from unity_check.git_service import _repo_name_from_url as git_repo_name
-
-    clone_base = os.path.abspath(settings.git_clone_base_dir)
-    # Try to find existing clone path; for manual trigger we try SSH format.
-    bare_candidate = os.path.join(
-        clone_base, f"{git_repo_name(f'git@github.com:{name}.git')}.git"
-    )
-    if not os.path.isdir(bare_candidate):
-        # Try https format
-        bare_candidate = os.path.join(
-            clone_base, f"{git_repo_name(f'https://github.com/{name}.git')}.git"
-        )
-
-    if not os.path.isdir(bare_candidate):
-        raise HTTPException(
-            status_code=400,
-            detail="Repository has not been cloned yet. "
-                    "Trigger a webhook first to initialise the bare clone.",
-        )
-
-    config.baseline_scan_status = "pending"
-    db.flush()
-
-    task = run_baseline_scan_task.delay(name, bare_candidate)
-    config.baseline_scan_status = "running"
-    db.flush()
-
-    return {
-        "status": "accepted",
-        "repository": name,
-        "task_id": task.id,
-        "message": "Baseline scan dispatched.",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +367,7 @@ def get_event_assessment(event_id: int, db: Session = Depends(get_db)) -> dict:
 
 @app.post("/api/events/{event_id}/re-evaluate")
 def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
-    """Delete existing evaluation rounds and re-trigger the full pipeline."""
+    """Delete existing evaluation rounds and re-run the full pipeline synchronously."""
     event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
     if event is None:
         raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
@@ -545,101 +388,14 @@ def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
     event.dimension_b_summary = None
     db.flush()
 
-    # Re-enqueue the pipeline task.
-    task = process_github_event.delay(event.id)
-    event.task_id = task.id
+    # Re-run evaluation pipeline synchronously.
+    run_evaluation_pipeline(event, db)
     db.commit()
 
     return {
-        "status": "accepted",
+        "status": "success",
         "event_id": event.id,
-        "task_id": task.id,
-        "message": "Re-evaluation triggered.",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Notification endpoints
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/notifications")
-def get_notifications(
-    event_id: int | None = None,
-    status: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-) -> list[dict]:
-    """Return notifications, optionally filtered by event_id or status."""
-    from sqlalchemy import select as sa_select
-
-    stmt = sa_select(Notification)
-    if event_id is not None:
-        stmt = stmt.where(Notification.event_id == event_id)
-    if status:
-        stmt = stmt.where(Notification.status == status)
-    stmt = (
-        stmt
-        .order_by(Notification.created_at.desc())
-        .limit(min(limit, 200))
-        .offset(max(0, offset))
-    )
-
-    rows = db.scalars(stmt).all()
-    return [
-        {
-            "id": n.id,
-            "event_id": n.event_id,
-            "channel": n.channel,
-            "trigger_reason": n.trigger_reason,
-            "risk_level": n.risk_level,
-            "message_content": n.message_content,
-            "webhook_url": n.webhook_url,
-            "status": n.status,
-            "sent_at": n.sent_at.isoformat() if n.sent_at else None,
-            "error_message": n.error_message,
-            "created_at": n.created_at.isoformat() if n.created_at else None,
-        }
-        for n in rows
-    ]
-
-
-@app.post("/api/notifications/{notification_id}/send-status")
-def update_notification_send_status(
-    notification_id: int,
-    body: dict,
-    db: Session = Depends(get_db),
-) -> dict:
-    """Callback endpoint for the external tool platform to update delivery status.
-
-    Request body:
-    {
-        "status": "sent" | "failed",
-        "error_message": "optional error detail"
-    }
-    """
-    from unity_check.notification_service import update_notification_status
-
-    new_status = str(body.get("status", "pending"))
-    if new_status not in ("sent", "failed", "pending"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status '{new_status}'. Must be sent, failed, or pending.",
-        )
-
-    error_msg = body.get("error_message")
-    notif = update_notification_status(
-        notification_id, new_status, db, error_message=str(error_msg) if error_msg else None
-    )
-    if notif is None:
-        raise HTTPException(status_code=404, detail=f"Notification {notification_id} not found")
-
-    return {
-        "id": notif.id,
-        "status": notif.status,
-        "sent_at": notif.sent_at.isoformat() if notif.sent_at else None,
-        "message": "Status updated.",
+        "message": "Re-evaluation completed.",
     }
 
 
@@ -781,23 +537,10 @@ def _dashboard_trends(days: int, repository: str | None, db: Session) -> list[di
 
 
 def _dashboard_issue_distribution(days: int, repository: str | None, db: Session) -> dict:
-    """Rule and semantic finding distribution: by category, severity, source."""
+    """Semantic finding distribution: by category, severity, source."""
     from datetime import datetime, timedelta, timezone
 
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
-
-    rule_base = select(RuleResult).join(GithubEvent).where(GithubEvent.created_at >= since)
-    if repository:
-        rule_base = rule_base.where(GithubEvent.repository == repository)
-    rules = db.scalars(rule_base).all()
-
-    rule_category_counts: dict[str, int] = {}
-    rule_severity_counts: dict[str, int] = {}
-    for r in rules:
-        cat = (r.category or "uncategorized").lower()
-        rule_category_counts[cat] = rule_category_counts.get(cat, 0) + 1
-        sev = r.severity.lower()
-        rule_severity_counts[sev] = rule_severity_counts.get(sev, 0) + 1
 
     # Semantic findings from evaluation_rounds (dimension rounds)
     eval_base = (
@@ -826,11 +569,6 @@ def _dashboard_issue_distribution(days: int, repository: str | None, db: Session
             semantic_severity_counts[sev] = semantic_severity_counts.get(sev, 0) + 1
 
     return {
-        "rules": {
-            "total": len(rules),
-            "by_category": rule_category_counts,
-            "by_severity": rule_severity_counts,
-        },
         "semantic": {
             "total": sum(semantic_category_counts.values()),
             "by_category": semantic_category_counts,
@@ -880,19 +618,22 @@ def _stats_scores(
 
 
 def _stats_hotspots(limit: int, days: int, repository: str | None, db: Session) -> list[dict]:
-    """Top files by rule-result count (hotspots)."""
+    """Top files by evaluation round count (hotspots)."""
     from datetime import datetime, timedelta, timezone
 
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
     base = (
-        select(RuleResult.file_path, func.count().label("cnt"))
+        select(EvaluationRound.file_path, func.count().label("cnt"))
         .join(GithubEvent)
-        .where(GithubEvent.created_at >= since)
+        .where(
+            GithubEvent.created_at >= since,
+            EvaluationRound.file_path.isnot(None),
+        )
     )
     if repository:
         base = base.where(GithubEvent.repository == repository)
     base = (
-        base.group_by(RuleResult.file_path)
+        base.group_by(EvaluationRound.file_path)
         .order_by(func.count().desc())
         .limit(min(limit, 50))
     )
