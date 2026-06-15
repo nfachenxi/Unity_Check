@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure SQLite data directory exists
+    db_path = settings.database_url.replace("sqlite:///", "", 1) if settings.database_url.startswith("sqlite") else None
+    if db_path:
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables are ready.")
     yield
@@ -273,6 +278,7 @@ def get_event_detail(
                     "score": r.score,
                     "tokens_used": r.tokens_used,
                     "duration_ms": r.duration_ms,
+                    "output_data": r.output_data,
                 }
                 for r in rounds
             ],

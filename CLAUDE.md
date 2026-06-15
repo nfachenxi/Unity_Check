@@ -4,16 +4,15 @@
 
 ## 技术栈
 
-Python 3.13 · FastAPI · Celery + Redis · PostgreSQL 16 · SQLAlchemy 2.0 · DeepSeek · Vue 3 + Element Plus · Roslyn .NET 8 · Docker Compose · uv
+Python 3.13 · FastAPI · SQLite · SQLAlchemy 2.0 · DeepSeek · Vue 3 + Element Plus · uv
 
 ## 项目结构
 
 ```
-src/unity_check/       # Python 后端核心 (FastAPI + Celery)
-roslyn-analyzer/       # Roslyn .NET 8 分析器 (Docker 容器)
-frontend/              # Vue3 + Element Plus + ECharts 前端
+src/unity_check/       # Python 后端核心 (FastAPI)
+frontend/              # Vue3 + Element Plus 前端
 tests/                 # pytest 测试
-scripts/               # 种子数据/工具脚本
+scripts/               # 工具脚本
 Demo/                  # 演示用 Unity C# 项目
 Docs/                  # 规划设计文档 (只读参考)
 ```
@@ -31,8 +30,7 @@ Docs/                  # 规划设计文档 (只读参考)
 | 变量 | `snake_case` | `event_id`, `diff_content` |
 | 常量/配置键 | `UPPER_SNAKE` | `DATABASE_URL`, `MAX_DIFF_CHARS` |
 | 数据库列 | `snake_case` | `event_type`, `before_sha` |
-| API 路径 | `kebab-case` | `/api/dashboard/summary`, `/events/{id}/rules` |
-| Celery 任务名 | `unity_check.<action>_<target>` | `unity_check.process_github_event` |
+| API 路径 | `kebab-case` | `/api/dashboard/summary`, `/events/{id}` |
 | 测试文件 | `test_<module>.py` | `test_git_service.py` |
 | 测试函数 | `test_<what>` | `test_extract_sha_from_payload` |
 | ORM back_populates | 与关系属性名一致 | `back_populates="rule_results"` |
@@ -54,7 +52,7 @@ Docs/                  # 规划设计文档 (只读参考)
 | `docs` | 文档/规范 |
 | `chore` | 构建/工具/依赖 |
 
-**scope**: `core`(编排/任务), `api`(FastAPI路由), `llm`(大模型), `git`(Git服务), `roslyn`(规则检测), `notify`(通知), `frontend`(前端), `config`(配置), `data`(种子数据)
+**scope**: `core`(编排/任务), `api`(FastAPI路由), `llm`(大模型), `git`(Git服务), `notify`(通知), `frontend`(前端), `config`(配置), `data`(数据)
 
 **示例**: `feat(api): add dashboard summary endpoint`, `fix(llm): handle json parse retry on empty response`
 
@@ -77,7 +75,6 @@ Docs/                  # 规划设计文档 (只读参考)
 - 分页接口返回 `{items, page, page_size, total, total_pages}`
 - 错误用 `HTTPException(status_code=N, detail="...")`
 - Webhook 入口必须校验签名 + 幂等 (delivery_id)
-- 异步操作用 `status_code=202` + Celery task_id 响应
 
 详见 [.claude/standards/api-design.md](.claude/standards/api-design.md)
 
@@ -93,11 +90,9 @@ Docs/                  # 规划设计文档 (只读参考)
 
 详见 [.claude/standards/data-model.md](.claude/standards/data-model.md)
 
-### 异步任务 (Celery)
+### 同步处理 (Webhook)
 
-- 任务函数用 `@celery_app.task(name="unity_check.<name>")` 装饰
-- 任务内自行创建 `SessionLocal()`，用后 `close()`
-- 长时间操作在任务开头更新状态为 `"running"`
+- Webhook 处理采用同步模式，直接在请求中完成 Git 操作和 LLM 评估
 - 异常必须捕获并持久化到 DB (`error_message` + `status="failed"`)
 - 幂等：同一事件重复执行不产生副作用
 
@@ -109,7 +104,7 @@ Docs/                  # 规划设计文档 (只读参考)
 - 测试文件放在 `tests/` 目录，命名 `test_<module>.py`
 - 共享 fixture 放 `conftest.py`
 - 每个测试函数只测一个行为
-- 外部依赖 (LLM API, Git, Roslyn) 使用 Mock
+- 外部依赖 (LLM API, Git) 使用 Mock
 
 详见 [.claude/standards/testing.md](.claude/standards/testing.md)
 
@@ -119,11 +114,9 @@ Docs/                  # 规划设计文档 (只读参考)
 
 ## 关键设计决策 (不可随意修改)
 
-1. **Roslyn 容器化** — 独立 .NET 8 Docker 容器，Python 通过 HTTP `POST /analyze` 调用
-2. **三轮评估流水线** — R1(规则汇总) → R2(LLM语义审查) → R3(LLM综合评分)，每轮独立持久化
-3. **通知与发送分离** — 通知服务仅构建消息+入库，实际发送由外部工具平台完成
-4. **幂等设计** — webhook 通过 `X-GitHub-Delivery` 幂等；RuleResult 通过 `event_id + scan_type` 幂等重写
-5. **演示降级** — Roslyn NuGet 分析器包运行时不可用时，通过 `seed_demo_data.py` 注入模拟数据
+1. **双维度评估流水线** — 每文件分别经过功能/最佳实践和安全/性能/健康度两个维度的 LLM 评估，然后程序化聚合评分
+2. **通知与发送分离** — 通知服务仅构建消息+入库，实际发送由外部工具平台完成
+3. **幂等设计** — webhook 通过 `X-GitHub-Delivery` 幂等；同一事件重复处理不产生副作用
 
 ## 禁止事项
 

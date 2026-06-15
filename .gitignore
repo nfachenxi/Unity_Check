@@ -11,3 +11,8 @@ Docs/
 .memory/
 .ssh/
 Demo/
+
+# SQLite database
+data/
+*.db
+repos

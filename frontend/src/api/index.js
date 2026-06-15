@@ -23,16 +23,12 @@ export function getEvents(params) {
   return api.get('/events', { params })
 }
 
-export function getEventDetail(id) {
-  return api.get(`/events/${id}`)
+export function getEventDetail(id, params = {}) {
+  return api.get(`/events/${id}`, { params })
 }
 
 export function getEventEvaluations(eventId) {
   return api.get(`/events/${eventId}/evaluations`)
-}
-
-export function getEventAssessment(eventId) {
-  return api.get(`/events/${eventId}`, { params: { include: 'assessment' } })
 }
 
 // ---- Stats ----

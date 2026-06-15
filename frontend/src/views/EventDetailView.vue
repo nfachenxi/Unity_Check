@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getEventDetail, getEventEvaluations, getEventAssessment } from '../api/index.js'
+import { getEventDetail, getEventEvaluations } from '../api/index.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 const loading = ref(true)
@@ -13,14 +13,24 @@ const activeTab = ref('dim-a')
 async function fetchData() {
   try {
     const id = parseInt(props.id, 10)
-    const [evtRes, evalRes, assessRes] = await Promise.all([
-      getEventDetail(id),
+    const [detailRes, evalRes] = await Promise.all([
+      getEventDetail(id, { include: 'assessment' }),
       getEventEvaluations(id),
-      getEventAssessment(id),
     ])
-    event.value = evtRes.data
+    const data = detailRes.data
+    event.value = data
     evaluations.value = evalRes.data || []
-    assessment.value = assessRes.data?.assessment || assessRes.data
+    assessment.value = data.assessment || {
+      overall_score: data.overall_score,
+      final_risk_level: data.final_risk_level,
+      recommendation: data.recommendation,
+      executive_summary: data.executive_summary,
+      dimension_a_score: data.dimension_a_score,
+      dimension_b_score: data.dimension_b_score,
+      rounds: evalRes.data || [],
+      total_tokens_used: (evalRes.data || []).reduce((s, r) => s + (r.tokens_used || 0), 0),
+      total_duration_ms: (evalRes.data || []).reduce((s, r) => s + (r.duration_ms || 0), 0),
+    }
   } catch (e) {
     ElMessage.error('加载事件详情失败')
   } finally {

@@ -1,68 +1,41 @@
 # Unity Check
 
-基于大模型与 Git 协作的 Unity 工程代码实时检测、多轮评估与智能通知系统。
+基于大模型与 Git 协作的 Unity 工程代码实时检测与评估系统。
 
 ## 核心能力
 
-- **Webhook 接收**：接收 GitHub push / pull_request 事件，自动触发代码评估流水线
-- **静态规则检测**：通过 Roslyn 分析器对 C# 代码进行规则级静态扫描
-- **多轮 LLM 评估**：三轮评估流水线（规则检测 → 语义审查 → 综合评分），利用 DeepSeek 大模型深度分析代码质量
-- **智能通知**：根据风险等级和评分自动生成企业微信 / 飞书通知消息
-- **可视化看板**：Vue3 + ECharts 前端，提供提交趋势、风险分布、问题热点的实时展示
+- **Webhook 接收**：接收 GitHub push / pull_request 事件，自动触发代码评估
+- **LLM 双维度评估**：对 diff 中的每个 .cs 文件进行功能/最佳实践 + 安全/性能/健康度评估
+- **可视化看板**：Vue3 + Element Plus 前端，提供事件列表、详情、看板与统计
 
 ## 技术栈
 
 | 层次 | 技术 |
 |------|------|
-| Web 框架 | FastAPI + Celery |
-| 数据库 | PostgreSQL 16 |
-| 缓存/队列 | Redis 7 |
-| 静态分析 | Roslyn (.NET 8, Docker 化) |
+| Web 框架 | FastAPI |
+| 数据库 | SQLite |
 | LLM | DeepSeek (OpenAI 兼容 API) |
 | 前端 | Vue 3 + Element Plus + ECharts + Vite |
-| 容器化 | Docker Compose (5 服务) |
 
 ## 快速启动
-
-### 环境要求
-
-- Docker & Docker Compose
-- Python 3.11+（本地开发）
-- Node.js 18+（前端开发）
 
 ### 1. 配置环境变量
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入 LLM_API_KEY、GITHUB_REMOTE_REPO 等实际值
+# 编辑 .env，填入 LLM_API_KEY
 ```
 
-### 2. 启动全部服务
+### 2. 启动后端
 
 ```bash
-docker compose up -d
+uv sync
+uv run uvicorn unity_check.main:app --app-dir src --reload
 ```
 
-启动后可用服务：
+后端启动在 `http://localhost:8000`。
 
-| 服务 | 端口 |
-|------|------|
-| FastAPI 后端 | 8000 |
-| Roslyn 分析器 | 8080 |
-| PostgreSQL | 5432 |
-| Redis | 6379 |
-
-### 3. 生成演示种子数据
-
-```bash
-# 生成 50 条历史事件，跨度 21 天
-uv run python scripts/seed_demo_history.py --count 50 --days 21
-
-# 或清除旧数据后重新生成
-uv run python scripts/seed_demo_history.py --count 50 --days 21 --clean
-```
-
-### 4. 启动前端（开发模式）
+### 3. 启动前端
 
 ```bash
 cd frontend
@@ -72,57 +45,23 @@ npm run dev
 
 前端启动在 `http://localhost:5173`，API 代理到后端 8000 端口。
 
-### 5. 模拟 webhook 触发评估
-
-```bash
-# 使用 Demo 仓库的两次提交 SHA 模拟 push 事件
-curl -X POST http://localhost:8000/webhook/github \
-  -H "Content-Type: application/json" \
-  -H "X-GitHub-Event: push" \
-  -d '{
-    "ref": "refs/heads/master",
-    "before": "03a00ae...",
-    "after": "860af7e...",
-    "repository": {"full_name": "nfachenxi/Unity_Check_Demo", "ssh_url": "git@github.com:nfachenxi/Unity_Check_Demo.git"},
-    "commits": [{}]
-  }'
-```
-
-### 6. 注入演示用规则数据
-
-```bash
-# 对刚创建的事件注入 15 条预设规则违规
-uv run python scripts/seed_demo_data.py <event_id>
-
-# 注入后立即触发重新评估
-uv run python scripts/seed_demo_data.py <event_id> --re-evaluate
-```
-
 ## 架构概览
 
 ```
 GitHub Push/PR
       │
       ▼
-[FastAPI Webhook] ──► [PostgreSQL: github_events]
+[FastAPI Webhook] ──► [SQLite: github_events]
       │
       ▼
-[Celery Worker (Redis)]
+[评估流水线] ──► [Git clone/fetch/diff]
+      │
+      ├──► [维度A: 功能与最佳实践 (DeepSeek)]
+      │
+      ├──► [维度B: 安全、性能与健康度 (DeepSeek)]
       │
       ▼
-[编排器] ──┬──► [Git Service: clone/fetch/diff]
-           │
-           ├──► [Round 1: Roslyn 规则检测]
-           │
-           ├──► [Round 2: LLM 语义审查 (DeepSeek)]
-           │
-           ├──► [Round 3: LLM 综合评分 (DeepSeek)]
-           │
-           ▼
-      [通知服务] ──► [企业微信 / 飞书]
-           │
-           ▼
-      [Vue3 看板] ◄── [FastAPI 查询 API]
+[程序化聚合评分] ──► [Vue3 看板]
 ```
 
 ## API 端点
@@ -132,56 +71,79 @@ GitHub Push/PR
 | `/health` | GET | 健康检查 |
 | `/webhook/github` | POST | GitHub webhook 接收 |
 | `/api/events` | GET | 事件分页列表（支持筛选） |
-| `/events/{id}` | GET | 事件详情（含 diff） |
-| `/events/{id}/rules` | GET | 规则检测结果 |
-| `/events/{id}/evaluations` | GET | 三轮评估详情 |
-| `/events/{id}/assessment` | GET | 综合评估结果 |
-| `/events/{id}/re-evaluate` | POST | 重新触发评估 |
-| `/api/dashboard/summary` | GET | 看板概览数据 |
-| `/api/dashboard/trends` | GET | 趋势数据 |
-| `/api/dashboard/issue-distribution` | GET | 问题分布 |
-| `/api/stats/scores` | GET | 评分统计 |
-| `/api/stats/hotspots` | GET | 文件热点 |
-| `/api/notifications` | GET | 通知列表 |
-| `/api/notifications/{id}/send-status` | POST | 通知状态回调 |
+| `/api/events/{id}` | GET | 事件详情 |
+| `/api/events/{id}/evaluations` | GET | 评估轮次详情 |
+| `/api/events/{id}/assessment` | GET | 综合评估结果 |
+| `/api/events/{id}/re-evaluate` | POST | 重新触发评估 |
+| `/api/dashboard` | GET | 看板数据（支持 section 参数） |
 
 ## 项目结构
 
 ```
 ├── src/unity_check/       # Python 后端核心
 │   ├── main.py            # FastAPI 应用 + 全部 API 端点
-│   ├── config.py           # 配置管理 (Pydantic Settings)
-│   ├── models.py           # ORM 数据模型 (SQLAlchemy)
-│   ├── orchestrator.py     # 三轮评估编排引擎
-│   ├── llm.py              # LLM 集成 (DeepSeek)
-│   ├── tasks.py            # Celery 异步任务
-│   ├── git_service.py      # Git clone/fetch/diff
-│   ├── rule_service.py     # Roslyn 分析器 HTTP 客户端
-│   ├── notification_service.py  # 通知构建与入库
-│   ├── db.py               # 数据库连接
-│   └── celery_app.py       # Celery 配置
-├── roslyn-analyzer/        # Roslyn .NET 8 分析器项目 (Docker)
-├── frontend/               # Vue3 + Element Plus 前端
-├── scripts/
-│   ├── seed_demo_data.py       # 单事件规则数据注入
-│   └── seed_demo_history.py    # 批量历史种子数据生成
-├── tests/                  # pytest 测试 (130 项)
-├── docker-compose.yml      # 5 服务 Docker 编排
-└── Demo/                   # 演示用 Unity C# 项目
+│   ├── config.py          # 配置管理 (Pydantic Settings)
+│   ├── models.py          # ORM 数据模型 (SQLAlchemy)
+│   ├── orchestrator.py    # 评估流水线编排
+│   ├── llm.py             # LLM 集成 (DeepSeek)
+│   ├── git_service.py     # Git clone/fetch/diff
+│   ├── rule_service.py    # Diff 解析
+│   ├── db.py              # 数据库连接
+│   └── migration.py       # 数据库迁移
+├── frontend/              # Vue3 + Element Plus 前端
+├── tests/                 # pytest 测试
+└── Demo/                  # 演示用 Unity C# 项目
 ```
 
-## 开发
+## 测试
+
+### 运行单元测试
 
 ```bash
-# 安装依赖
-uv sync
+uv run pytest tests/ -q          # 快速运行全部测试
+uv run pytest tests/ -v          # 详细输出
+uv run pytest tests/ --cov       # 测试覆盖率报告
+uv run pytest tests/test_webhook.py -v  # 仅测试 webhook 模块
+```
 
-# 运行测试 (130 项)
-uv run pytest tests/ -q
+测试默认 Mock LLM API，无需真实 API Key。
 
-# 启动开发服务器
+### 手动触发端到端测试
+
+```bash
+# 0. 准备本地 Git 仓库（若 GitHub 不可达）
+git clone --bare Demo/Unity_Check_Demo repos/github_com_nfachenxi_Unity_Check_Demo.git
+
+# 1. 启动后端
 uv run uvicorn unity_check.main:app --app-dir src --reload
 
-# 启动 Celery Worker
-uv run celery -A unity_check.celery_app:celery_app worker --loglevel=INFO
+# 2. 启动前端（新终端）
+cd frontend && npm run dev
+
+# 3. 模拟 GitHub push webhook
+cd Demo/Unity_Check_Demo
+curl -X POST http://localhost:8000/webhook/github \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: push" \
+  -d '{
+    "ref": "refs/heads/master",
+    "before": "03a00ae",
+    "after": "860af7e",
+    "repository": {
+      "full_name": "demo/Unity_Check_Demo",
+      "clone_url": "https://github.com/nfachenxi/Unity_Check_Demo.git"
+    },
+    "commits": [{}]
+  }'
 ```
+
+等待 20-60 秒完成评估后，打开 `http://localhost:5173` 查看结果。
+
+### 快速验证清单
+
+- [ ] `curl http://localhost:8000/health` 返回 `{"status":"ok"}`
+- [ ] `uv run pytest tests/ -q` 全部通过
+- [ ] `http://localhost:5173` 前端加载正常
+- [ ] `LLM_API_KEY` 已正确配置
+
+详细测试指南见 [TESTING_GUIDE.md](TESTING_GUIDE.md)。
