@@ -319,6 +319,7 @@ def get_event_evaluations(event_id: int, db: Session = Depends(get_db)) -> list[
             "tokens_used": r.tokens_used,
             "duration_ms": r.duration_ms,
             "error_message": r.error_message,
+            "output_data": r.output_data,
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "completed_at": r.completed_at.isoformat() if r.completed_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
