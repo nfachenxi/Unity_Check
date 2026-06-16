@@ -6,7 +6,7 @@ const route = useRoute()
 const router = useRouter()
 
 const pageTitle = computed(() => {
-  const titles = { Dashboard: '概览看板', EventList: '事件列表', EventDetail: '事件详情', Stats: '统计中心' }
+  const titles = { Dashboard: '概览看板', EventList: '事件列表', EventDetail: '事件详情', Stats: '统计中心', RepositoryList: '仓库管理' }
   return titles[route.name] || 'Unity Check'
 })
 
@@ -16,6 +16,7 @@ const breadcrumb = computed(() => {
   else if (route.name === 'EventList') parts.push('事件列表')
   else if (route.name === 'EventDetail') parts.push('事件列表', '事件详情')
   else if (route.name === 'Stats') parts.push('统计中心')
+  else if (route.name === 'RepositoryList') parts.push('仓库管理')
   else parts.push('Unity Check')
   return parts
 })

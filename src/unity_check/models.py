@@ -10,6 +10,33 @@ if TYPE_CHECKING:
     pass
 
 
+class Repository(Base):
+    """Registered git repository for monitoring."""
+
+    __tablename__ = "repositories"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    clone_url: Mapped[str | None] = mapped_column(String(1024))
+    webhook_secret: Mapped[str | None] = mapped_column(String(128))
+    ssh_key_path: Mapped[str | None] = mapped_column(String(512))
+    branch_filter: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    local_path: Mapped[str | None] = mapped_column(String(512))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # relationships
+    events: Mapped[list["GithubEvent"]] = relationship(back_populates="repository_rel")
+
+
 class GithubEvent(Base):
     __tablename__ = "github_events"
 
@@ -18,6 +45,9 @@ class GithubEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     action: Mapped[str | None] = mapped_column(String(64), index=True)
     repository: Mapped[str | None] = mapped_column(String(255), index=True)
+    repository_id: Mapped[int | None] = mapped_column(
+        ForeignKey("repositories.id", ondelete="SET NULL"), index=True
+    )
     after_sha: Mapped[str | None] = mapped_column(String(40), index=True)
     before_sha: Mapped[str | None] = mapped_column(String(40))
     clone_path: Mapped[str | None] = mapped_column(String(512))
@@ -46,6 +76,7 @@ class GithubEvent(Base):
     evaluation_rounds: Mapped[list["EvaluationRound"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
+    repository_rel: Mapped["Repository | None"] = relationship(back_populates="events")
 
 
 class EvaluationRound(Base):

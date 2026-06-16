@@ -1,5 +1,7 @@
 """Tests for webhook parsing and event endpoints (simplified)."""
 
+import hashlib
+import hmac
 import json
 from uuid import uuid4
 
@@ -9,6 +11,23 @@ from fastapi.testclient import TestClient
 from unity_check.db import get_db
 from unity_check.main import app
 from unity_check.models import EvaluationRound, GithubEvent
+from unity_check import repository_service
+
+
+@pytest.fixture(autouse=True)
+def _register_test_repo(session):
+    """Ensure test/repo is registered so webhook tests pass."""
+    try:
+        repo = repository_service.create_repository(
+            session,
+            name="test/repo",
+            clone_url="https://github.com/test/repo.git",
+            is_active=True,
+        )
+        session.flush()
+    except ValueError:
+        repo = repository_service.get_repository_by_name(session, "test/repo")
+    return repo
 
 
 @pytest.fixture(autouse=True)
@@ -17,7 +36,7 @@ def _override_dependencies(monkeypatch, session):
     app.dependency_overrides[get_db] = lambda: session
 
     # Mock git operations so webhook doesn't try real clone/fetch
-    def fake_ensure_bare_repo(clone_url):
+    def fake_ensure_bare_repo(clone_url, ssh_key_path=None):
         return "/fake/path.git"
 
     def fake_get_diff(bare_repo_path, before_sha, after_sha):
@@ -256,3 +275,141 @@ class TestEventDetail:
     def test_nonexistent_event_returns_404(self, client):
         resp = client.get("/api/events/99999")
         assert resp.status_code == 404
+
+
+class TestWebhookSecurity:
+    """Webhook signature verification and repo access control."""
+
+    UNREGISTERED_PAYLOAD = {
+        "ref": "refs/heads/main",
+        "before": "a" * 40,
+        "after": "b" * 40,
+        "repository": {"full_name": "evil/unregistered", "clone_url": "https://github.com/evil/unregistered.git"},
+    }
+
+    def test_unregistered_repo_returns_404(self, client):
+        resp = client.post(
+            "/webhook/github",
+            headers={"X-GitHub-Event": "push", "X-GitHub-Delivery": "delivery-evil"},
+            content=json.dumps(self.UNREGISTERED_PAYLOAD).encode(),
+        )
+        assert resp.status_code == 404
+        assert "not registered" in resp.json()["detail"]
+
+    def test_missing_signature_returns_401(self, client, session, _register_test_repo):
+        """When repo has a webhook_secret, missing signature is rejected."""
+        # Give test/repo a secret
+        repository_service.update_repository(
+            session, _register_test_repo.id, webhook_secret="my-secret"
+        )
+        session.commit()
+        payload = {
+            "ref": "refs/heads/main",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
+        }
+        resp = client.post(
+            "/webhook/github",
+            headers={"X-GitHub-Event": "push", "X-GitHub-Delivery": "delivery-nosig"},
+            content=json.dumps(payload).encode(),
+        )
+        assert resp.status_code == 401
+        assert "Missing" in resp.json()["detail"]
+
+    def test_invalid_signature_returns_401(self, client, session, _register_test_repo):
+        repository_service.update_repository(
+            session, _register_test_repo.id, webhook_secret="my-secret"
+        )
+        session.commit()
+        payload = {
+            "ref": "refs/heads/main",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
+        }
+        body = json.dumps(payload).encode()
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "delivery-badsig",
+                "X-Hub-Signature-256": "sha256=0000000000000000000000000000000000000000",
+            },
+            content=body,
+        )
+        assert resp.status_code == 401
+        assert "Invalid" in resp.json()["detail"]
+
+    def test_valid_signature_passes(self, client, session, _register_test_repo):
+        repository_service.update_repository(
+            session, _register_test_repo.id, webhook_secret="my-secret"
+        )
+        session.commit()
+        payload = {
+            "ref": "refs/heads/main",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
+        }
+        body = json.dumps(payload).encode()
+        sig = "sha256=" + hmac.new(b"my-secret", body, hashlib.sha256).hexdigest()
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "delivery-validsig",
+                "X-Hub-Signature-256": sig,
+            },
+            content=body,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "success"
+
+
+class TestWebhookBranchFilter:
+    """Branch filter skips/processes webhooks based on branch_pattern."""
+
+    def test_branch_filter_skips_unmatched(self, client, session, _register_test_repo):
+        repository_service.update_repository(
+            session, _register_test_repo.id, branch_filter='["main"]'
+        )
+        session.commit()
+        payload = {
+            "ref": "refs/heads/feature/x",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
+        }
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "delivery-filter-skip",
+            },
+            content=json.dumps(payload).encode(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "skipped"
+
+    def test_branch_filter_allows_matched(self, client, session, _register_test_repo):
+        repository_service.update_repository(
+            session, _register_test_repo.id, branch_filter='["main", "release/*"]'
+        )
+        session.commit()
+        payload = {
+            "ref": "refs/heads/main",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "repository": {"full_name": "test/repo", "clone_url": "https://github.com/test/repo.git"},
+        }
+        resp = client.post(
+            "/webhook/github",
+            headers={
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "delivery-filter-allow",
+            },
+            content=json.dumps(payload).encode(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "success"

@@ -5,11 +5,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
 
+from unity_check import repository_service, webhook_service
 from unity_check.config import get_settings
-from unity_check.db import Base, engine, get_db
+from unity_check.db import Base, engine, get_db, run_migrations
 from unity_check.git_service import (
     GitServiceError,
     ensure_bare_repo,
@@ -17,7 +19,7 @@ from unity_check.git_service import (
     extract_sha_from_payload,
     get_diff,
 )
-from unity_check.models import EvaluationRound, GithubEvent
+from unity_check.models import EvaluationRound, GithubEvent, Repository
 from unity_check.orchestrator import run_evaluation_pipeline
 
 settings = get_settings()
@@ -29,6 +31,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class RepositoryCreate(BaseModel):
+    """Request body for POST /api/repositories."""
+    name: str
+    clone_url: str | None = None
+    webhook_secret: str | None = None
+    ssh_key_path: str | None = None
+    branch_filter: str | None = None
+    is_active: bool | None = None
+
+
+class RepositoryUpdate(BaseModel):
+    """Request body for PUT /api/repositories/{id}."""
+    clone_url: str | None = None
+    webhook_secret: str | None = None
+    ssh_key_path: str | None = None
+    branch_filter: str | None = None
+    is_active: bool | None = None
+    status: str | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure SQLite data directory exists
@@ -36,6 +58,7 @@ async def lifespan(app: FastAPI):
     if db_path:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    run_migrations()
     logger.info("Database tables are ready.")
     yield
 
@@ -54,6 +77,7 @@ async def receive_github_webhook(
     request: Request,
     x_github_event: str = Header(default="", alias="X-GitHub-Event"),
     x_github_delivery: str | None = Header(default=None, alias="X-GitHub-Delivery"),
+    x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
     db: Session = Depends(get_db),
 ):
     """Receive a GitHub webhook and process synchronously.
@@ -87,11 +111,41 @@ async def receive_github_webhook(
     action = payload.get("action") if isinstance(payload, dict) else None
     before_sha, after_sha = extract_sha_from_payload(payload, event_type)
 
+    # --- Repository lookup & validation ---
+    repo_obj = None
+    if repository:
+        repo_obj = webhook_service.lookup_repository(db, repository)
+        if repo_obj is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Repository '{repository}' is not registered. "
+                       "Register it via POST /api/repositories first.",
+            )
+        if not repo_obj.is_active:
+            raise HTTPException(status_code=403, detail=f"Repository '{repository}' is disabled.")
+
+    # --- Signature verification ---
+    if repo_obj and repo_obj.webhook_secret:
+        if not x_hub_signature_256:
+            raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
+        if not webhook_service.verify_webhook_signature(
+            payload_bytes, repo_obj.webhook_secret, x_hub_signature_256
+        ):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # --- Branch filtering (push only) ---
+    if repo_obj and repo_obj.branch_filter and event_type == "push":
+        ref = payload.get("ref", "")
+        if not webhook_service.match_branch(ref, repo_obj.branch_filter):
+            logger.info("Branch %s filtered out for repo %s", ref, repository)
+            return {"status": "skipped", "reason": f"Branch {ref} not in filter"}
+
     event = GithubEvent(
         delivery_id=x_github_delivery,
         event_type=event_type,
         action=action,
         repository=repository,
+        repository_id=repo_obj.id if repo_obj else None,
         before_sha=before_sha,
         after_sha=after_sha,
         payload=payload,
@@ -104,25 +158,34 @@ async def receive_github_webhook(
     try:
         clone_url = extract_clone_url_from_payload(payload)
         if clone_url and after_sha:
-            bare_path = ensure_bare_repo(clone_url)
+            bare_path = ensure_bare_repo(
+                clone_url,
+                ssh_key_path=repo_obj.ssh_key_path if repo_obj else None,
+            )
             event.clone_path = bare_path
             diff = get_diff(bare_path, before_sha or "", after_sha)
             event.diff_content = diff
             event.diff_size = len(diff.encode("utf-8")) if diff else 0
 
         run_evaluation_pipeline(event, db)
+        if repo_obj:
+            repository_service.mark_repository_synced(db, repo_obj.id)
         db.commit()
         return {"status": "success", "event_id": str(event.id)}
     except GitServiceError as exc:
         logger.exception("Git workflow failed for event %s", event.id)
         event.status = "failed"
         event.error_message = str(exc)
+        if repo_obj:
+            repository_service.mark_repository_error(db, repo_obj.id, str(exc))
         db.commit()
         return {"status": "failed", "event_id": str(event.id), "error": str(exc)}
     except Exception as exc:
         logger.exception("Sync processing failed for event %s", event.id)
         event.status = "failed"
         event.error_message = str(exc)
+        if repo_obj:
+            repository_service.mark_repository_error(db, repo_obj.id, str(exc))
         db.commit()
         return {"status": "failed", "event_id": str(event.id), "error": str(exc)}
 
@@ -404,6 +467,99 @@ def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
         "event_id": event.id,
         "message": "Re-evaluation completed.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Repository management
+# ---------------------------------------------------------------------------
+
+
+def _repo_to_dict(repo: Repository) -> dict:
+    """Serialize a Repository to a safe API response dict (no secret)."""
+    return {
+        "id": repo.id,
+        "name": repo.name,
+        "clone_url": repo.clone_url,
+        "ssh_key_path": repo.ssh_key_path,
+        "branch_filter": repo.branch_filter,
+        "is_active": repo.is_active,
+        "status": repo.status,
+        "last_synced_at": repo.last_synced_at.isoformat() if repo.last_synced_at else None,
+        "local_path": repo.local_path,
+        "error_message": repo.error_message,
+        "created_at": repo.created_at.isoformat() if repo.created_at else None,
+        "updated_at": repo.updated_at.isoformat() if repo.updated_at else None,
+    }
+
+
+@app.get("/api/repositories")
+def list_repositories_api(
+    is_active: bool | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """List all registered repositories."""
+    repos = repository_service.list_repositories(db, is_active=is_active)
+    return [_repo_to_dict(r) for r in repos]
+
+
+@app.post("/api/repositories", status_code=201)
+def create_repository_api(
+    body: RepositoryCreate,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Register a new repository."""
+    try:
+        repo = repository_service.create_repository(
+            db,
+            name=body.name,
+            clone_url=body.clone_url,
+            webhook_secret=body.webhook_secret,
+            ssh_key_path=body.ssh_key_path,
+            branch_filter=body.branch_filter,
+            is_active=body.is_active if body.is_active is not None else True,
+        )
+        db.commit()
+        return _repo_to_dict(repo)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/api/repositories/{repo_id}")
+def get_repository_detail(repo_id: int, db: Session = Depends(get_db)) -> dict:
+    """Get repository details by id."""
+    repo = repository_service.get_repository(db, repo_id)
+    if repo is None:
+        raise HTTPException(status_code=404, detail=f"Repository {repo_id} not found")
+    return _repo_to_dict(repo)
+
+
+@app.put("/api/repositories/{repo_id}")
+def update_repository_api(
+    repo_id: int,
+    body: RepositoryUpdate,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Update repository configuration."""
+    try:
+        repo = repository_service.update_repository(
+            db, repo_id, **body.model_dump(exclude_unset=True)
+        )
+        if repo is None:
+            raise HTTPException(status_code=404, detail=f"Repository {repo_id} not found")
+        db.commit()
+        return _repo_to_dict(repo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/repositories/{repo_id}")
+def delete_repository_api(repo_id: int, db: Session = Depends(get_db)) -> dict:
+    """Delete a repository (events kept, FK set NULL)."""
+    ok = repository_service.delete_repository(db, repo_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Repository {repo_id} not found")
+    db.commit()
+    return {"status": "deleted", "id": repo_id}
 
 
 # ---------------------------------------------------------------------------

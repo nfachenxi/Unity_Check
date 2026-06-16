@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
 
     git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
+    git_ssh_key_path: str | None = Field(default=None, alias="GIT_SSH_KEY_PATH")
 
 
 @lru_cache()

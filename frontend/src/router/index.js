@@ -26,6 +26,12 @@ const routes = [
     component: () => import('../views/StatsView.vue'),
     meta: { title: '统计中心' },
   },
+  {
+    path: '/repositories',
+    name: 'RepositoryList',
+    component: () => import('../views/RepositoryListView.vue'),
+    meta: { title: '仓库管理' },
+  },
 ]
 
 const router = createRouter({

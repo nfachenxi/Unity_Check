@@ -40,4 +40,25 @@ export function getStatsHotspots(params) {
   return api.get('/dashboard', { params: { ...params, section: 'hotspots' } })
 }
 
+// ---- Repositories ----
+export function getRepositories(params) {
+  return api.get('/repositories', { params })
+}
+
+export function getRepositoryDetail(id) {
+  return api.get(`/repositories/${id}`)
+}
+
+export function createRepository(data) {
+  return api.post('/repositories', data)
+}
+
+export function updateRepository(id, data) {
+  return api.put(`/repositories/${id}`, data)
+}
+
+export function deleteRepository(id) {
+  return api.delete(`/repositories/${id}`)
+}
+
 export default api

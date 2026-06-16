@@ -30,8 +30,12 @@ def _repo_name_from_url(clone_url: str) -> str:
     return cleaned.strip("_") or "unknown"
 
 
-def ensure_bare_repo(clone_url: str) -> str:
+def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     """Clone a bare repo or fetch if it already exists.
+
+    When *ssh_key_path* is provided, the ``GIT_SSH_COMMAND``
+    environment variable is set for the duration of the operation,
+    allowing private-repo access via the specified SSH key.
 
     Returns the absolute path to the bare repo directory.
     """
@@ -41,35 +45,49 @@ def ensure_bare_repo(clone_url: str) -> str:
     repo_dir = _repo_name_from_url(clone_url)
     bare_path = os.path.join(clone_base, f"{repo_dir}.git")
 
-    if os.path.isdir(bare_path):
-        logger.info("Fetching existing bare repo: %s", bare_path)
-        try:
-            repo = git.Repo(bare_path)
+    # Set up SSH command if key path provided (restore in finally block)
+    _prev_ssh = os.environ.get("GIT_SSH_COMMAND")
+    if ssh_key_path:
+        os.environ["GIT_SSH_COMMAND"] = (
+            f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no"
+        )
+
+    try:
+        if os.path.isdir(bare_path):
+            logger.info("Fetching existing bare repo: %s", bare_path)
             try:
-                has_refspec = bool(repo.git.config("--get", "remote.origin.fetch"))
-            except Exception:
-                has_refspec = False
-            if not has_refspec:
-                repo.git.remote("set-url", "origin", clone_url)
-                repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
-            origin = repo.remote("origin")
-            origin.fetch()
-        except Exception as exc:
-            raise GitServiceError(
-                f"Failed to fetch bare repo at {bare_path}: {exc}"
-            ) from exc
-    else:
-        logger.info("Cloning bare repo: %s -> %s", clone_url, bare_path)
-        try:
-            git.Repo.clone_from(
-                clone_url,
-                bare_path,
-                bare=True,
-            )
-        except Exception as exc:
-            raise GitServiceError(
-                f"Failed to clone bare repo from {clone_url}: {exc}"
-            ) from exc
+                repo = git.Repo(bare_path)
+                try:
+                    has_refspec = bool(repo.git.config("--get", "remote.origin.fetch"))
+                except Exception:
+                    has_refspec = False
+                if not has_refspec:
+                    repo.git.remote("set-url", "origin", clone_url)
+                    repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
+                origin = repo.remote("origin")
+                origin.fetch()
+            except Exception as exc:
+                raise GitServiceError(
+                    f"Failed to fetch bare repo at {bare_path}: {exc}"
+                ) from exc
+        else:
+            logger.info("Cloning bare repo: %s -> %s", clone_url, bare_path)
+            try:
+                git.Repo.clone_from(
+                    clone_url,
+                    bare_path,
+                    bare=True,
+                )
+            except Exception as exc:
+                raise GitServiceError(
+                    f"Failed to clone bare repo from {clone_url}: {exc}"
+                ) from exc
+    finally:
+        if ssh_key_path:
+            if _prev_ssh:
+                os.environ["GIT_SSH_COMMAND"] = _prev_ssh
+            else:
+                os.environ.pop("GIT_SSH_COMMAND", None)
 
     return bare_path
 
