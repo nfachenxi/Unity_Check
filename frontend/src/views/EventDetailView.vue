@@ -1,7 +1,15 @@
 <script setup>
 import { ref, onMounted, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
+import VChart from 'vue-echarts'
+import { use } from 'echarts/core'
+import { GaugeChart } from 'echarts/charts'
+import { TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import { getEventDetail, getEventEvaluations } from '../api/index.js'
+import FileEvaluationBlock from '../components/dashboard/FileEvaluationBlock.vue'
+
+use([GaugeChart, TooltipComponent, CanvasRenderer])
 
 const props = defineProps({ id: { type: String, required: true } })
 const loading = ref(true)
@@ -39,9 +47,6 @@ async function fetchData() {
 }
 
 // Filter evaluation rounds by type
-const ruleCheckRound = computed(() =>
-  null
-)
 const dimARounds = computed(() =>
   evaluations.value.filter(r => r.round_type === 'functionality_best_practices')
 )
@@ -49,25 +54,83 @@ const dimBRounds = computed(() =>
   evaluations.value.filter(r => r.round_type === 'security_performance_health')
 )
 
-// Collect all findings from dimension rounds
-const dimAFindings = computed(() => {
-  const f = []
-  for (const r of dimARounds.value) {
-    for (const finding of (r.output_data?.findings || [])) {
-      f.push({ ...finding, file_path: r.file_path, round_id: r.id })
-    }
-  }
-  return f
+// Diff view with line numbers
+const diffLines = computed(() => {
+  if (!event.value?.diff_content) return []
+  return event.value.diff_content.split('\n').map((line, i) => ({
+    lineNumber: i + 1,
+    content: line,
+    type: line.startsWith('+') ? 'add' : line.startsWith('-') ? 'remove' : line.startsWith('@@') ? 'header' : 'normal',
+    marker: line.startsWith('+') ? '+' : line.startsWith('-') ? '-' : ' ',
+  }))
 })
-const dimBFindings = computed(() => {
-  const f = []
-  for (const r of dimBRounds.value) {
-    for (const finding of (r.output_data?.findings || [])) {
-      f.push({ ...finding, file_path: r.file_path, round_id: r.id })
-    }
+
+// Gauge chart option
+const gaugeOption = computed(() => {
+  const score = assessment.value?.overall_score ?? 0
+  const color = score >= 80 ? '#22C55E' : score >= 60 ? '#F59E0B' : '#EF4444'
+
+  return {
+    series: [{
+      type: 'gauge',
+      startAngle: 220,
+      endAngle: -40,
+      min: 0,
+      max: 100,
+      pointer: { show: false },
+      progress: {
+        show: true,
+        width: 12,
+        itemStyle: { color },
+      },
+      axisLine: {
+        lineStyle: {
+          width: 12,
+          color: [[1, 'rgba(255,255,255,0.08)']],
+        },
+      },
+      axisTick: { show: false },
+      splitLine: { show: false },
+      axisLabel: { show: false },
+      detail: { show: false },
+      data: [{ value: score }],
+      title: { show: false },
+      center: ['50%', '55%'],
+      radius: '80%',
+    }],
   }
-  return f
 })
+
+// Dimension mini-gauge options
+function dimGaugeOption(score) {
+  const color = score >= 80 ? '#22C55E' : score >= 60 ? '#F59E0B' : '#EF4444'
+  return {
+    series: [{
+      type: 'gauge',
+      startAngle: 220,
+      endAngle: -40,
+      min: 0,
+      max: 100,
+      pointer: { show: false },
+      progress: {
+        show: true,
+        width: 6,
+        itemStyle: { color },
+      },
+      axisLine: {
+        lineStyle: { width: 6, color: [[1, 'rgba(255,255,255,0.06)']] },
+      },
+      axisTick: { show: false },
+      splitLine: { show: false },
+      axisLabel: { show: false },
+      detail: { show: false },
+      data: [{ value: score }],
+      title: { show: false },
+      center: ['50%', '55%'],
+      radius: '75%',
+    }],
+  }
+}
 
 function getRiskType(level) {
   return level === 'critical' || level === 'high' ? 'danger' : level === 'medium' ? 'warning' : 'success'
@@ -90,6 +153,7 @@ onMounted(fetchData)
 
 <template>
   <div v-loading="loading">
+    <!-- Header -->
     <div class="detail-header">
       <h1 class="page-title" style="margin-bottom: 0;">事件详情</h1>
       <el-tag v-if="event" :type="getRiskType(event.final_risk_level)" size="large" effect="dark">
@@ -119,18 +183,41 @@ onMounted(fetchData)
       </el-descriptions>
     </div>
 
-    <!-- Score Display -->
-    <div v-if="assessment" class="score-bar">
-      <div class="score-circle">
-        <div class="score-number">{{ assessment.overall_score?.toFixed(0) ?? '-' }}</div>
-        <div class="score-label">综合评分</div>
+    <!-- Score Display with Gauge -->
+    <div v-if="assessment" class="score-section">
+      <div class="score-main">
+        <VChart :option="gaugeOption" style="width: 130px; height: 130px" autoresize />
+        <div class="score-main-text">
+          <div class="score-big">{{ assessment.overall_score?.toFixed(0) ?? '-' }}</div>
+          <div class="score-label">综合评分</div>
+          <div class="score-rec">{{ (assessment.recommendation || '').replace('_', ' ') }}</div>
+        </div>
+      </div>
+      <div class="score-dims">
+        <div class="dim-item" v-if="assessment.dimension_a_score != null">
+          <VChart :option="dimGaugeOption(assessment.dimension_a_score)" style="width: 72px; height: 72px" autoresize />
+          <div class="dim-item-text">
+            <div class="dim-item-label">维度A</div>
+            <div class="dim-item-score">{{ assessment.dimension_a_score.toFixed(1) }}</div>
+          </div>
+        </div>
+        <div class="dim-item" v-if="assessment.dimension_b_score != null">
+          <VChart :option="dimGaugeOption(assessment.dimension_b_score)" style="width: 72px; height: 72px" autoresize />
+          <div class="dim-item-text">
+            <div class="dim-item-label">维度B</div>
+            <div class="dim-item-score">{{ assessment.dimension_b_score.toFixed(1) }}</div>
+          </div>
+        </div>
       </div>
       <div class="score-meta">
-        <div><span class="meta-label">建议：</span><span class="rec-text">{{ (assessment.recommendation || '').replace('_', ' ') }}</span></div>
-        <div><span class="meta-label">维度A(功能/最佳实践)：</span>{{ assessment.dimension_a_score?.toFixed(1) ?? '-' }}</div>
-        <div><span class="meta-label">维度B(安全/性能/健康度)：</span>{{ assessment.dimension_b_score?.toFixed(1) ?? '-' }}</div>
-        <div><span class="meta-label">总 Token：</span>{{ assessment.total_tokens_used?.toLocaleString() ?? '-' }}</div>
-        <div><span class="meta-label">总耗时：</span>{{ formatMs(assessment.total_duration_ms) }}</div>
+        <div class="meta-row">
+          <span class="meta-label">Token 消耗</span>
+          <span class="meta-value">{{ assessment.total_tokens_used?.toLocaleString() ?? '-' }}</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">评估耗时</span>
+          <span class="meta-value">{{ formatMs(assessment.total_duration_ms) }}</span>
+        </div>
       </div>
     </div>
 
@@ -139,100 +226,78 @@ onMounted(fetchData)
       <el-tabs v-model="activeTab" type="border-card">
         <!-- Dimension A Tab -->
         <el-tab-pane label="维度A · 功能与最佳实践" name="dim-a">
-          <div class="round-header">
-            <span class="round-badge badge-ok">已评估 {{ dimARounds.length }} 文件</span>
-            <span class="round-info" v-if="dimARounds.length">
-              均分: {{ assessment?.dimension_a_score?.toFixed(1) ?? '-' }} |
-              Token: {{ dimARounds.reduce((s,r) => s + (r.tokens_used || 0), 0) }}
-            </span>
-          </div>
-          <div v-for="r in dimARounds" :key="r.id" class="file-eval-block">
-            <h4 class="file-eval-title">📄 {{ r.file_path }} — 评分: {{ r.score?.toFixed(0) ?? 'N/A' }}</h4>
-            <p class="file-eval-summary">{{ r.output_data?.summary || '无摘要' }}</p>
-            <div v-if="r.status === 'failed'" class="error-block">
-              <el-alert :title="r.error_message" type="error" show-icon :closable="false" />
-            </div>
-            <div v-else class="findings-list">
-              <div v-for="(f, i) in (r.output_data?.findings || [])" :key="i" class="finding-item">
-                <div class="finding-title">
-                  <el-tag :type="f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warning' : 'info'" size="small" effect="dark">
-                    {{ f.severity || '?' }}
-                  </el-tag>
-                  <span class="finding-name">{{ f.title }}</span>
-                  <el-tag size="small" type="info">{{ f.category }}</el-tag>
-                </div>
-                <div class="finding-desc">{{ f.description }}</div>
-                <div v-if="f.suggestion" class="finding-suggestion">💡 {{ f.suggestion }}</div>
-                <div v-if="f.line_hint" class="finding-file">📍 {{ f.line_hint }}</div>
-              </div>
-              <el-empty v-if="!r.output_data?.findings?.length" description="此文件未发现问题" />
-            </div>
-          </div>
-          <el-empty v-if="!dimARounds.length" description="未执行维度A评估" />
+          <FileEvaluationBlock
+            :evaluations="dimARounds"
+            dimension-name="维度A"
+            :dimension-score="assessment?.dimension_a_score"
+          />
         </el-tab-pane>
 
         <!-- Dimension B Tab -->
         <el-tab-pane label="维度B · 安全与性能" name="dim-b">
-          <div class="round-header">
-            <span class="round-badge badge-ok">已评估 {{ dimBRounds.length }} 文件</span>
-            <span class="round-info" v-if="dimBRounds.length">
-              均分: {{ assessment?.dimension_b_score?.toFixed(1) ?? '-' }} |
-              Token: {{ dimBRounds.reduce((s,r) => s + (r.tokens_used || 0), 0) }}
-            </span>
-          </div>
-          <div v-for="r in dimBRounds" :key="r.id" class="file-eval-block">
-            <h4 class="file-eval-title">📄 {{ r.file_path }} — 评分: {{ r.score?.toFixed(0) ?? 'N/A' }}</h4>
-            <p class="file-eval-summary">{{ r.output_data?.summary || '无摘要' }}</p>
-            <div v-if="r.status === 'failed'" class="error-block">
-              <el-alert :title="r.error_message" type="error" show-icon :closable="false" />
-            </div>
-            <div v-else class="findings-list">
-              <div v-for="(f, i) in (r.output_data?.findings || [])" :key="i" class="finding-item">
-                <div class="finding-title">
-                  <el-tag :type="f.severity === 'critical' || f.severity === 'high' ? 'danger' : f.severity === 'medium' ? 'warning' : 'info'" size="small" effect="dark">
-                    {{ f.severity || '?' }}
-                  </el-tag>
-                  <span class="finding-name">{{ f.title }}</span>
-                  <el-tag size="small" type="info">{{ f.category }}</el-tag>
-                </div>
-                <div class="finding-desc">{{ f.description }}</div>
-                <div v-if="f.suggestion" class="finding-suggestion">💡 {{ f.suggestion }}</div>
-                <div v-if="f.line_hint" class="finding-file">📍 {{ f.line_hint }}</div>
-              </div>
-              <el-empty v-if="!r.output_data?.findings?.length" description="此文件未发现问题" />
-            </div>
-          </div>
-          <el-empty v-if="!dimBRounds.length" description="未执行维度B评估" />
+          <FileEvaluationBlock
+            :evaluations="dimBRounds"
+            dimension-name="维度B"
+            :dimension-score="assessment?.dimension_b_score"
+          />
         </el-tab-pane>
 
-        <!-- Diff Tab -->
+        <!-- Diff View Tab -->
         <el-tab-pane label="Diff 视图" name="diff">
-          <div class="diff-view" v-if="event?.diff_content">
-            <pre>{{ event.diff_content }}</pre>
+          <div v-if="diffLines.length" class="diff-view">
+            <div
+              v-for="(line, i) in diffLines"
+              :key="i"
+              class="diff-line"
+              :class="line.type"
+            >
+              <span class="diff-line-num">{{ line.lineNumber }}</span>
+              <span class="diff-marker">{{ line.marker }}</span>
+              <span class="diff-line-content">{{ line.content }}</span>
+            </div>
           </div>
           <el-empty v-else description="无 Diff 内容" />
         </el-tab-pane>
 
         <!-- Summary Assessment Tab -->
         <el-tab-pane label="评估摘要" name="assessment">
-          <div class="score-display">
-            <div class="big-score">{{ assessment?.overall_score?.toFixed(0) ?? '-' }}</div>
-            <div class="big-score-label">/100</div>
-          </div>
-          <div class="dim-scores" style="display:flex;gap:24px;justify-content:center;margin:8px 0;">
-            <div>维度A (功能/最佳实践): <strong>{{ assessment?.dimension_a_score?.toFixed(1) ?? '-' }}</strong></div>
-            <div>维度B (安全/性能/健康度): <strong>{{ assessment?.dimension_b_score?.toFixed(1) ?? '-' }}</strong></div>
-          </div>
-          <div class="summary-block" style="margin-top: 16px;">
-            <p>{{ event?.executive_summary || '暂无评估摘要' }}</p>
-          </div>
-          <div v-if="event?.dimension_a_summary" class="summary-block" style="margin-top: 12px;">
-            <h4>维度A 摘要</h4>
-            <p>{{ event.dimension_a_summary }}</p>
-          </div>
-          <div v-if="event?.dimension_b_summary" class="summary-block" style="margin-top: 12px;">
-            <h4>维度B 摘要</h4>
-            <p>{{ event.dimension_b_summary }}</p>
+          <div class="assessment-content">
+            <!-- Overall score -->
+            <div class="assessment-score">
+              <div class="big-score" :style="{ color: (assessment?.overall_score ?? 0) >= 80 ? 'var(--color-success)' : (assessment?.overall_score ?? 0) >= 60 ? 'var(--color-warning)' : 'var(--color-critical)' }">
+                {{ assessment?.overall_score?.toFixed(0) ?? '-' }}
+              </div>
+              <div class="big-score-label">/ 100</div>
+            </div>
+            <!-- Dimension scores -->
+            <div class="assessment-dims">
+              <div class="assessment-dim">
+                <span class="dim-indicator dim-a"></span>
+                <span>维度A</span>
+                <strong>{{ assessment?.dimension_a_score?.toFixed(1) ?? '-' }}</strong>
+              </div>
+              <div class="assessment-dim">
+                <span class="dim-indicator dim-b"></span>
+                <span>维度B</span>
+                <strong>{{ assessment?.dimension_b_score?.toFixed(1) ?? '-' }}</strong>
+              </div>
+            </div>
+            <!-- Summary text blocks -->
+            <div class="summary-blocks">
+              <div class="summary-block" v-if="event?.executive_summary">
+                <div class="summary-block-title">执行摘要</div>
+                <p>{{ event.executive_summary }}</p>
+              </div>
+              <div class="summary-block" v-if="event?.dimension_a_summary">
+                <div class="summary-block-title">维度A · 功能与最佳实践</div>
+                <p>{{ event.dimension_a_summary }}</p>
+              </div>
+              <div class="summary-block" v-if="event?.dimension_b_summary">
+                <div class="summary-block-title">维度B · 安全与性能</div>
+                <p>{{ event.dimension_b_summary }}</p>
+              </div>
+              <el-empty v-if="!event?.executive_summary && !event?.dimension_a_summary && !event?.dimension_b_summary" description="暂无评估摘要" />
+            </div>
           </div>
         </el-tab-pane>
       </el-tabs>
@@ -253,202 +318,241 @@ onMounted(fetchData)
   margin-bottom: 16px;
 }
 
-.score-bar {
+/* ---- Score Section ---- */
+.score-section {
   display: flex;
   align-items: center;
   gap: 32px;
-  padding: 24px;
-  background: var(--el-fill-color-light);
-  border-radius: 8px;
+  padding: 20px 28px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
   margin-bottom: 16px;
 }
 
-.score-circle {
-  width: 100px;
-  height: 100px;
-  border-radius: 50%;
-  background: var(--el-color-primary-light-9);
+.score-main {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  border: 3px solid var(--el-color-primary);
+  gap: 12px;
+  flex-shrink: 0;
 }
 
-.score-number {
-  font-size: 28px;
+.score-main-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.score-big {
+  font-family: var(--font-heading);
+  font-size: 32px;
   font-weight: 700;
-  color: var(--el-color-primary);
-  line-height: 1.2;
+  line-height: 1;
+  color: var(--color-text);
 }
 
 .score-label {
   font-size: 12px;
-  color: var(--el-text-color-secondary);
+  color: var(--color-text-muted);
 }
 
-.score-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 14px;
-}
-
-.meta-label {
-  font-weight: 600;
-  color: var(--el-text-color-regular);
-}
-
-.rec-text {
+.score-rec {
+  font-size: 12px;
+  color: var(--color-primary);
   text-transform: capitalize;
+  font-family: var(--font-heading);
 }
 
-.round-header {
+.score-dims {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
+  gap: 24px;
+  flex-shrink: 0;
 }
 
-.round-badge {
-  background: var(--el-color-info-light-5);
-  color: var(--el-color-info);
-  padding: 2px 10px;
-  border-radius: 12px;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.round-badge.badge-ok {
-  background: var(--el-color-success-light-5);
-  color: var(--el-color-success);
-}
-
-.round-badge.badge-fail {
-  background: var(--el-color-danger-light-5);
-  color: var(--el-color-danger);
-}
-
-.round-info {
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-}
-
-.file-eval-block {
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 6px;
-  padding: 12px 16px;
-  margin-bottom: 12px;
-}
-
-.file-eval-title {
-  margin: 0 0 4px;
-  font-size: 14px;
-}
-
-.file-eval-summary {
-  margin: 0 0 8px;
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-}
-
-.error-block {
-  margin: 8px 0;
-}
-
-.findings-list {
-  margin-top: 8px;
-}
-
-.finding-item {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--el-border-color-extra-light);
-}
-
-.finding-item:last-child {
-  border-bottom: none;
-}
-
-.finding-title {
+.dim-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 4px;
-  flex-wrap: wrap;
 }
 
-.finding-name {
+.dim-item-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.dim-item-label {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.dim-item-score {
+  font-family: var(--font-heading);
+  font-size: 16px;
   font-weight: 600;
+  color: var(--color-text);
+}
+
+.score-meta {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.meta-row {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.meta-label {
+  color: var(--color-text-muted);
+  font-family: var(--font-heading);
+}
+
+.meta-value {
+  color: var(--color-text);
+  font-family: var(--font-heading);
+}
+
+/* ---- Assessment Tab ---- */
+.assessment-content {
+  max-width: 700px;
+  margin: 0 auto;
+  padding: 16px 0;
+}
+
+.assessment-score {
+  text-align: center;
+  margin-bottom: 16px;
+}
+
+.big-score {
+  font-size: 56px;
+  font-weight: 800;
+  font-family: var(--font-heading);
+  line-height: 1;
+}
+
+.big-score-label {
+  font-size: 16px;
+  color: var(--color-text-muted);
+  font-family: var(--font-heading);
+  margin-top: 4px;
+}
+
+.assessment-dims {
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+  margin-bottom: 24px;
+}
+
+.assessment-dim {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
+
+.assessment-dim strong {
+  color: var(--color-text);
+  font-family: var(--font-heading);
+}
+
+.dim-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.dim-indicator.dim-a { background: var(--color-primary); }
+.dim-indicator.dim-b { background: var(--color-info); }
+
+.summary-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.summary-block {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 16px 20px;
+}
+
+.summary-block-title {
+  font-family: var(--font-heading);
   font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
 }
 
-.finding-desc {
-  font-size: 13px;
-  color: var(--el-text-color-regular);
-  margin: 4px 0;
+.summary-block p {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--color-text-secondary);
 }
 
-.finding-suggestion {
-  font-size: 12px;
-  color: var(--el-color-success);
-  margin-top: 2px;
-}
-
-.finding-file {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-top: 2px;
-}
-
-.file-path {
-  font-size: 12px;
-  background: var(--el-fill-color);
-  padding: 1px 4px;
-  border-radius: 3px;
-}
-
+/* ---- Diff View Tab ---- */
 .diff-view {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  padding: 16px;
-  border-radius: 6px;
+  background: #0d1117;
+  border-radius: var(--radius-sm);
+  padding: 12px 0;
+  font-family: var(--font-heading);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-x: auto;
   max-height: 500px;
-  overflow: auto;
+  overflow-y: auto;
 }
 
-.diff-view pre {
-  margin: 0;
+.diff-line {
+  display: flex;
+  padding: 0 12px;
+  min-height: 22px;
+  align-items: stretch;
+}
+
+.diff-line:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.diff-line-num {
+  min-width: 40px;
+  text-align: right;
+  padding-right: 12px;
+  color: var(--color-text-muted);
+  user-select: none;
   font-size: 12px;
-  font-family: 'Cascadia Code', 'Fira Code', monospace;
+}
+
+.diff-marker {
+  width: 16px;
+  user-select: none;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.diff-line-content {
+  flex: 1;
   white-space: pre-wrap;
   word-break: break-all;
 }
 
-.big-score {
-  font-size: 48px;
-  font-weight: 800;
-  color: var(--el-color-primary);
-}
+.diff-line.add { background: rgba(34, 197, 94, 0.08); }
+.diff-line.add .diff-line-num { color: var(--color-success); }
+.diff-line.add .diff-marker { color: var(--color-success); }
 
-.big-score-label {
-  font-size: 18px;
-  color: var(--el-text-color-secondary);
-  margin-top: 4px;
-}
+.diff-line.remove { background: rgba(239, 68, 68, 0.08); }
+.diff-line.remove .diff-line-num { color: var(--color-critical); }
+.diff-line.remove .diff-marker { color: var(--color-critical); }
 
-.score-display {
-  text-align: center;
-}
-
-.summary-block p {
-  line-height: 1.7;
-  color: var(--el-text-color-regular);
-}
-
-.summary-block h4 {
-  margin: 0 0 4px;
-  font-size: 14px;
-  color: var(--el-text-color-secondary);
-}
+.diff-line.header { background: rgba(99, 102, 241, 0.06); }
+.diff-line.header .diff-line-num { color: var(--color-info); }
+.diff-line.header .diff-line-content { color: var(--color-info); }
 </style>

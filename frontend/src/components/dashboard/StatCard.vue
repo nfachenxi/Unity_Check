@@ -17,8 +17,8 @@ defineProps({
         <span v-if="unit" class="value-unit">{{ unit }}</span>
       </div>
     </div>
-    <div class="stat-icon-box" :style="{ background: color + '20' }">
-      <el-icon :size="28" :color="color">
+    <div class="stat-icon-box" :style="{ background: color + '18' }">
+      <el-icon :size="26" :color="color">
         <component :is="icon" />
       </el-icon>
     </div>
@@ -34,12 +34,14 @@ defineProps({
   display: flex;
   align-items: center;
   justify-content: space-between;
-  transition: border-color 200ms ease;
-  cursor: pointer;
+  transition: border-color 200ms ease, box-shadow 200ms ease, transform 200ms ease;
+  box-shadow: var(--shadow-sm);
 }
 
 .stat-card:hover {
   border-color: var(--card-color);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(59, 130, 246, 0.06);
+  transform: translateY(-1px);
 }
 
 .stat-title {
@@ -67,8 +69,8 @@ defineProps({
 }
 
 .stat-icon-box {
-  width: 52px;
-  height: 52px;
+  width: 48px;
+  height: 48px;
   border-radius: 12px;
   display: flex;
   align-items: center;

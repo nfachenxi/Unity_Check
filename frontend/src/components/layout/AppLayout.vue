@@ -1,19 +1,30 @@
 <script setup>
 import SideNav from './SideNav.vue'
 import AppHeader from './AppHeader.vue'
+import { ref } from 'vue'
+
+const sidebarCollapsed = ref(false)
+
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+}
 </script>
 
 <template>
   <el-container class="app-container">
-    <el-aside width="220px" class="app-aside">
-      <SideNav />
+    <el-aside :width="sidebarCollapsed ? '64px' : '220px'" class="app-aside">
+      <SideNav :collapsed="sidebarCollapsed" @toggle="toggleSidebar" />
     </el-aside>
     <el-container>
       <el-header height="56px" class="app-header">
         <AppHeader />
       </el-header>
       <el-main class="app-main">
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <transition name="fade" mode="out-in">
+            <component :is="Component" />
+          </transition>
+        </router-view>
       </el-main>
     </el-container>
   </el-container>
@@ -27,7 +38,8 @@ import AppHeader from './AppHeader.vue'
 .app-aside {
   background: var(--color-secondary);
   border-right: 1px solid var(--color-border);
-  overflow-y: auto;
+  overflow: hidden;
+  transition: width 250ms ease;
 }
 
 .app-header {
