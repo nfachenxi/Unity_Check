@@ -20,6 +20,7 @@ from unity_check.git_service import (
     generate_full_cs_diff,
     get_default_branch_head,
     get_diff,
+    resolve_bare_path,
 )
 from unity_check.models import EvaluationRound, GithubEvent, Repository
 from unity_check.orchestrator import run_evaluation_pipeline
@@ -530,10 +531,21 @@ def create_repository_api(
         # Optional: trigger full scan after registration
         if scan and repo.clone_url:
             try:
-                bare_path = ensure_bare_repo(
-                    repo.clone_url,
-                    ssh_key_path=repo.ssh_key_path,
-                )
+                try:
+                    bare_path = ensure_bare_repo(
+                        repo.clone_url,
+                        ssh_key_path=repo.ssh_key_path,
+                    )
+                except GitServiceError:
+                    _detect = resolve_bare_path(repo.clone_url)
+                    if _detect and os.path.isdir(_detect):
+                        logger.warning(
+                            "Initial scan fetch failed for %s, using existing bare repo",
+                            repo.name,
+                        )
+                        bare_path = _detect
+                    else:
+                        raise
                 sha = get_default_branch_head(bare_path)
                 if sha:
                     diff = generate_full_cs_diff(bare_path, sha)
@@ -624,6 +636,10 @@ def scan_repository(
 
     This can be triggered at any time, including right after registration
     to establish a baseline assessment of existing code.
+
+    If the bare repo already exists (previously cloned) but ``git fetch``
+    fails (e.g. network issue or expired credentials), the endpoint will
+    fall back to scanning the already-fetched data rather than failing.
     """
     repo = repository_service.get_repository(db, repo_id)
     if repo is None:
@@ -635,13 +651,39 @@ def scan_repository(
             detail="Repository has no clone_url configured — set one via PUT /api/repositories/{id}",
         )
 
-    # Clone / fetch bare repo
-    bare_path = ensure_bare_repo(
-        repo.clone_url,
-        ssh_key_path=repo.ssh_key_path,
-    )
+    # Track if we are in a fallback mode (fetch failed, using existing data)
+    fallback = False
 
-    # Resolve default branch HEAD
+    # ---- Clone / fetch bare repo --------------------------------------------
+    try:
+        bare_path = ensure_bare_repo(
+            repo.clone_url,
+            ssh_key_path=repo.ssh_key_path,
+        )
+    except GitServiceError:
+        # If fetch failed but the bare repo directory exists, use existing data.
+        _detect_bare_path = resolve_bare_path(repo.clone_url)
+        if _detect_bare_path and os.path.isdir(_detect_bare_path):
+            logger.warning(
+                "Fetch failed for %s but bare repo exists at %s — "
+                "falling back to existing data",
+                repo.name, _detect_bare_path,
+            )
+            bare_path = _detect_bare_path
+            fallback = True
+        else:
+            logger.exception("Failed to clone/fetch repo %s (id=%s)", repo.name, repo_id)
+            repository_service.mark_repository_error(
+                db, repo.id,
+                "无法连接远程仓库，请检查 clone_url 和 SSH 密钥配置",
+            )
+            db.commit()
+            raise HTTPException(
+                status_code=502,
+                detail="无法连接到远程仓库，请检查 clone_url 和 SSH 密钥配置是否正确。",
+            )
+
+    # ---- Resolve default branch HEAD ----------------------------------------
     sha = get_default_branch_head(bare_path)
     if not sha:
         raise HTTPException(
@@ -650,10 +692,10 @@ def scan_repository(
                    "Ensure the repository has at least one commit.",
         )
 
-    # Generate full .cs diff
+    # ---- Generate full .cs diff ---------------------------------------------
     diff = generate_full_cs_diff(bare_path, sha)
 
-    # Create an initial_scan event
+    # ---- Create an initial_scan event ---------------------------------------
     event = GithubEvent(
         delivery_id=None,
         event_type="initial_scan",
@@ -669,13 +711,14 @@ def scan_repository(
             "repository": {"full_name": repo.name},
             "scan_type": "full",
             "commit_sha": sha,
+            "fallback": fallback,
         },
         status="running",
     )
     db.add(event)
     db.flush()
 
-    # Run evaluation pipeline
+    # ---- Run evaluation pipeline --------------------------------------------
     try:
         result = run_evaluation_pipeline(event, db)
         repository_service.mark_repository_synced(db, repo.id)
@@ -684,20 +727,32 @@ def scan_repository(
             "status": "success",
             "event_id": event.id,
             "commit_sha": sha,
+            "fallback": fallback,
             **result,
         }
-    except (GitServiceError, Exception) as exc:
+    except Exception as exc:
         logger.exception("Full scan failed for repo %s (id=%s)", repo.name, repo_id)
         event.status = "failed"
         event.error_message = str(exc)
-        repository_service.mark_repository_error(db, repo.id, str(exc))
+        _mark_repository_error_safe(db, repo.id, "扫描评估失败: " + str(exc))
         db.commit()
         return {
             "status": "failed",
             "event_id": event.id,
             "commit_sha": sha,
+            "fallback": fallback,
             "error": str(exc),
         }
+
+
+def _mark_repository_error_safe(
+    db: Session, repo_id: int, message: str,
+) -> None:
+    """Set repository error status, swallowing any session exceptions."""
+    try:
+        repository_service.mark_repository_error(db, repo_id, message)
+    except Exception:
+        logger.warning("Failed to mark repo %s error (session may be invalid)", repo_id)
 
 
 @app.delete("/api/repositories/{repo_id}")

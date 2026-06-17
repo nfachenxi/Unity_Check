@@ -30,6 +30,20 @@ def _repo_name_from_url(clone_url: str) -> str:
     return cleaned.strip("_") or "unknown"
 
 
+def resolve_bare_path(clone_url: str) -> str:
+    """Resolve the expected bare repo directory path for a clone URL.
+
+    This is a pure path computation — it does not touch the filesystem or
+    perform any git operations. Use it to check whether a bare repo already
+    exists on disk without triggering a clone or fetch.
+    """
+    from unity_check.config import get_settings as _get_settings
+
+    clone_base = os.path.abspath(_get_settings().git_clone_base_dir)
+    repo_dir = _repo_name_from_url(clone_url)
+    return os.path.join(clone_base, f"{repo_dir}.git")
+
+
 def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     """Clone a bare repo or fetch if it already exists.
 
