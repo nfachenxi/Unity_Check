@@ -160,6 +160,16 @@ def get_diff(bare_repo_path: str, before_sha: str, after_sha: str) -> str:
         return ""
 
 
+def _object_exists(repo, sha: str) -> bool:
+    """Check whether a git object (commit, tree, blob) exists in *repo*."""
+    import git
+    try:
+        repo.git.cat_file("-e", sha)
+        return True
+    except Exception:
+        return False
+
+
 def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     """Generate a unified diff treating all tracked .cs files as new additions.
 
@@ -195,6 +205,18 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
         commit = repo.commit(sha)
     except Exception as exc:
         raise GitServiceError(f"Commit {sha} not found in bare repo: {exc}") from exc
+
+    # Ensure the empty tree object exists in the object database
+    # (4b825dc642cb6eb9a060e54bf899d15303643e6c is the well-known SHA for an
+    # empty tree, but it's not guaranteed to be present in every bare repo).
+    if not _object_exists(repo, _EMPTY_TREE):
+        logger.info("Empty tree object not found — creating it in %s", bare_repo_path)
+        try:
+            repo.git.hash_object("-t", "tree", "--stdin", "-w", stdin_data=b"")
+        except Exception as exc:
+            raise GitServiceError(
+                f"Failed to create empty tree object in {bare_repo_path}: {exc}"
+            ) from exc
 
     # List all tracked .cs files in this commit's tree
     cs_files = sorted(
