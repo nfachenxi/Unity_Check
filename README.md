@@ -494,7 +494,7 @@ GitHub 配置成功后会自动发送 ping 事件。在 Unity Check 事件列表
 | 仓库名称 | **是** | 格式 `owner/repo`，如 `myteam/unity-project` |
 | Clone URL | 否 | Git 克隆地址，默认使用 `https://github.com/owner/repo.git` |
 | Webhook Secret | 否 | GitHub Webhook 签名密钥，用于 HMAC-SHA256 验证 |
-| SSH Key 路径 | 否 | 私有仓库 SSH 密钥路径 |
+| SSH Key 路径 | 否 | 私有仓库 SSH 密钥路径(/home/unity-check/.ssh/id_ed25519) |
 | 分支过滤 | 否 | JSON 数组，如 `["main", "release/*"]`，留空监听所有分支 |
 | 活跃 | 否 | 是否启用此仓库的监听 |
 

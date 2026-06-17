@@ -212,7 +212,7 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     if not _object_exists(repo, _EMPTY_TREE):
         logger.info("Empty tree object not found — creating it in %s", bare_repo_path)
         try:
-            repo.git.hash_object("-t", "tree", "--stdin", "-w", stdin_data=b"")
+            repo.git.hash_object("-t", "tree", "--stdin", "-w", input=b"")
         except Exception as exc:
             raise GitServiceError(
                 f"Failed to create empty tree object in {bare_repo_path}: {exc}"
