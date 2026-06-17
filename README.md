@@ -294,10 +294,11 @@ curl http://localhost:8000/ | head -5
 
 ### 8. 配置 systemd 实现持久化运行
 
-#### 8.1 创建专用系统用户（可选但推荐）
+#### 8.1 创建专用系统用户（推荐）
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin unity-check
+# 创建系统用户（带家目录，供 uv 缓存使用）
+sudo useradd --system --create-home --shell /usr/sbin/nologin unity-check
 sudo chown -R unity-check:unity-check /opt/unity_check
 ```
 
@@ -320,7 +321,7 @@ Type=simple
 User=unity-check
 Group=unity-check
 WorkingDirectory=/opt/unity_check
-ExecStart=/opt/unity_check/.venv/bin/uv run uvicorn unity_check.main:app --app-dir src --host 0.0.0.0 --port 8000
+ExecStart=/opt/unity_check/.venv/bin/uvicorn unity_check.main:app --app-dir src --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/opt/unity_check/logs/unity-check.log
@@ -337,6 +338,10 @@ PrivateTmp=true
 WantedBy=multi-user.target
 ```
 
+> **注意**：直接使用 `.venv/bin/uvicorn` 而非 `uv run uvicorn`，因为：
+> 1. systemd 的 `ProtectHome=true` 会屏蔽 `/home` 目录，导致 uv 缓存写入失败
+> 2. 直接启动 uvicorn 不依赖 uv 缓存，更稳定
+>
 > 如果修改了端口，同步修改 `ExecStart` 中的 `--port` 值。
 
 #### 8.3 启动服务
