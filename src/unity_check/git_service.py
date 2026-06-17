@@ -214,8 +214,7 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
         logger.info("Empty tree object not found — creating it in %s", bare_repo_path)
         try:
             subprocess.run(
-                ["git", "hash-object", "-t", "tree", "--stdin", "-w"],
-                cwd=bare_repo_path,
+                ["git", "--git-dir", bare_repo_path, "hash-object", "-t", "tree", "--stdin", "-w"],
                 capture_output=True,
                 input=b"",
                 timeout=30,
