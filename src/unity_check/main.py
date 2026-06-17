@@ -3,7 +3,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select, text
@@ -17,6 +17,8 @@ from unity_check.git_service import (
     ensure_bare_repo,
     extract_clone_url_from_payload,
     extract_sha_from_payload,
+    generate_full_cs_diff,
+    get_default_branch_head,
     get_diff,
 )
 from unity_check.models import EvaluationRound, GithubEvent, Repository
@@ -505,9 +507,14 @@ def list_repositories_api(
 @app.post("/api/repositories", status_code=201)
 def create_repository_api(
     body: RepositoryCreate,
+    scan: bool = Query(False, description="Trigger a full initial scan after registration"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Register a new repository."""
+    """Register a new repository.
+
+    When ``?scan=true`` is set and *clone_url* is provided, the repository
+    is cloned and a full ``initial_scan`` event is triggered immediately.
+    """
     try:
         repo = repository_service.create_repository(
             db,
@@ -518,8 +525,59 @@ def create_repository_api(
             branch_filter=body.branch_filter,
             is_active=body.is_active if body.is_active is not None else True,
         )
+        result = _repo_to_dict(repo)
+
+        # Optional: trigger full scan after registration
+        if scan and repo.clone_url:
+            try:
+                bare_path = ensure_bare_repo(
+                    repo.clone_url,
+                    ssh_key_path=repo.ssh_key_path,
+                )
+                sha = get_default_branch_head(bare_path)
+                if sha:
+                    diff = generate_full_cs_diff(bare_path, sha)
+                    event = GithubEvent(
+                        delivery_id=None,
+                        event_type="initial_scan",
+                        action="scan",
+                        repository=repo.name,
+                        repository_id=repo.id,
+                        after_sha=sha,
+                        clone_path=bare_path,
+                        diff_content=diff,
+                        diff_size=len(diff.encode("utf-8")) if diff else 0,
+                        payload={
+                            "repository": {"full_name": repo.name},
+                            "scan_type": "full",
+                            "commit_sha": sha,
+                        },
+                        status="running",
+                    )
+                    db.add(event)
+                    db.flush()
+
+                    scan_result = run_evaluation_pipeline(event, db)
+                    repository_service.mark_repository_synced(db, repo.id)
+                    result["scan"] = {
+                        "status": "success",
+                        "event_id": event.id,
+                        **scan_result,
+                    }
+                else:
+                    result["scan"] = {
+                        "status": "skipped",
+                        "reason": "Could not resolve default branch HEAD — repository may be empty",
+                    }
+            except Exception as exc:
+                logger.warning("Initial scan failed for new repo %s: %s", repo.name, exc)
+                result["scan"] = {
+                    "status": "failed",
+                    "error": str(exc),
+                }
+
         db.commit()
-        return _repo_to_dict(repo)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -550,6 +608,96 @@ def update_repository_api(
         return _repo_to_dict(repo)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/repositories/{repo_id}/scan")
+def scan_repository(
+    repo_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Trigger a full scan of all tracked .cs files in the repository.
+
+    Clones / fetches the bare repo, resolves the default branch HEAD,
+    generates a unified diff of all ``.cs`` files (as new additions against
+    ``/dev/null``), creates an ``initial_scan`` event, and runs the full
+    evaluation pipeline on every file.
+
+    This can be triggered at any time, including right after registration
+    to establish a baseline assessment of existing code.
+    """
+    repo = repository_service.get_repository(db, repo_id)
+    if repo is None:
+        raise HTTPException(status_code=404, detail=f"Repository {repo_id} not found")
+
+    if not repo.clone_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Repository has no clone_url configured — set one via PUT /api/repositories/{id}",
+        )
+
+    # Clone / fetch bare repo
+    bare_path = ensure_bare_repo(
+        repo.clone_url,
+        ssh_key_path=repo.ssh_key_path,
+    )
+
+    # Resolve default branch HEAD
+    sha = get_default_branch_head(bare_path)
+    if not sha:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not resolve a default branch HEAD from the bare repository. "
+                   "Ensure the repository has at least one commit.",
+        )
+
+    # Generate full .cs diff
+    diff = generate_full_cs_diff(bare_path, sha)
+
+    # Create an initial_scan event
+    event = GithubEvent(
+        delivery_id=None,
+        event_type="initial_scan",
+        action="scan",
+        repository=repo.name,
+        repository_id=repo.id,
+        after_sha=sha,
+        before_sha=None,
+        clone_path=bare_path,
+        diff_content=diff,
+        diff_size=len(diff.encode("utf-8")) if diff else 0,
+        payload={
+            "repository": {"full_name": repo.name},
+            "scan_type": "full",
+            "commit_sha": sha,
+        },
+        status="running",
+    )
+    db.add(event)
+    db.flush()
+
+    # Run evaluation pipeline
+    try:
+        result = run_evaluation_pipeline(event, db)
+        repository_service.mark_repository_synced(db, repo.id)
+        db.commit()
+        return {
+            "status": "success",
+            "event_id": event.id,
+            "commit_sha": sha,
+            **result,
+        }
+    except (GitServiceError, Exception) as exc:
+        logger.exception("Full scan failed for repo %s (id=%s)", repo.name, repo_id)
+        event.status = "failed"
+        event.error_message = str(exc)
+        repository_service.mark_repository_error(db, repo.id, str(exc))
+        db.commit()
+        return {
+            "status": "failed",
+            "event_id": event.id,
+            "commit_sha": sha,
+            "error": str(exc),
+        }
 
 
 @app.delete("/api/repositories/{repo_id}")

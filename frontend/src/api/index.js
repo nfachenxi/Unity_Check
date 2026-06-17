@@ -49,8 +49,8 @@ export function getRepositoryDetail(id) {
   return api.get(`/repositories/${id}`)
 }
 
-export function createRepository(data) {
-  return api.post('/repositories', data)
+export function createRepository(data, config = {}) {
+  return api.post('/repositories', data, config)
 }
 
 export function updateRepository(id, data) {
@@ -59,6 +59,10 @@ export function updateRepository(id, data) {
 
 export function deleteRepository(id) {
   return api.delete(`/repositories/${id}`)
+}
+
+export function scanRepository(id) {
+  return api.post(`/repositories/${id}/scan`, null, { timeout: 120000 })
 }
 
 export default api

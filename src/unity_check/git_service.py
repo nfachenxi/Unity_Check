@@ -146,6 +146,102 @@ def get_diff(bare_repo_path: str, before_sha: str, after_sha: str) -> str:
         return ""
 
 
+def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
+    """Generate a unified diff treating all tracked .cs files as new additions.
+
+    Uses ``git diff-tree -p --root <sha> -- <path>`` for each tracked ``.cs``
+    file so the output is a standard unified diff (``--- /dev/null`` /
+    ``+++ b/<path>``) that the existing evaluation pipeline
+    (``extract_cs_files_from_diff`` / ``_extract_file_diff``) can process
+    without modification.
+
+    Returns an empty string when no ``.cs`` files are found.
+    """
+    import git
+
+    if not os.path.isdir(bare_repo_path):
+        raise GitServiceError(f"Bare repo not found: {bare_repo_path}")
+
+    try:
+        repo = git.Repo(bare_repo_path)
+    except Exception as exc:
+        raise GitServiceError(f"Failed to open repo {bare_repo_path}: {exc}") from exc
+
+    # Verify the commit exists
+    try:
+        commit = repo.commit(sha)
+    except Exception as exc:
+        raise GitServiceError(f"Commit {sha} not found in bare repo: {exc}") from exc
+
+    # List all tracked .cs files in this commit's tree
+    cs_files = sorted(
+        b.path for b in commit.tree.traverse()
+        if b.type == "blob" and b.path.lower().endswith(".cs")
+    )
+    if not cs_files:
+        logger.info("No .cs files found in commit %s", sha)
+        return ""
+
+    # Generate a per-file diff from /dev/null
+    diff_blocks: list[str] = []
+    for fp in cs_files:
+        try:
+            block = repo.git.diff_tree("-p", "--root", sha, "--", fp)
+            if block:
+                diff_blocks.append(block)
+        except Exception as exc:
+            logger.warning("Failed to diff %s from commit %s: %s", fp, sha, exc)
+            continue
+
+    if not diff_blocks:
+        return ""
+
+    return "\n".join(diff_blocks)
+
+
+def get_default_branch_head(bare_repo_path: str) -> str | None:
+    """Resolve the default branch HEAD SHA from a bare repo.
+
+    Resolution order:
+    1. ``HEAD`` symbolic reference
+    2. Common branch names (``main`` / ``master`` / ``develop``)
+    3. First available branch as a last resort
+
+    Returns ``None`` when no commit can be resolved.
+    """
+    import git
+
+    if not os.path.isdir(bare_repo_path):
+        raise GitServiceError(f"Bare repo not found: {bare_repo_path}")
+
+    try:
+        repo = git.Repo(bare_repo_path)
+    except Exception as exc:
+        raise GitServiceError(f"Failed to open repo {bare_repo_path}: {exc}") from exc
+
+    # 1. Resolve HEAD directly
+    try:
+        return repo.head.commit.hexsha
+    except Exception:
+        pass
+
+    # 2. Common branch names
+    for branch in ("main", "master", "develop"):
+        try:
+            return repo.commit(branch).hexsha
+        except Exception:
+            continue
+
+    # 3. Any available branch
+    try:
+        for b in repo.branches:
+            return b.commit.hexsha
+    except Exception:
+        pass
+
+    return None
+
+
 def extract_sha_from_payload(
     payload: dict[str, Any], event_type: str
 ) -> tuple[str | None, str | None]:

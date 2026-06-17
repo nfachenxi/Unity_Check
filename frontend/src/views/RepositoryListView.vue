@@ -6,15 +6,18 @@ import {
   createRepository,
   updateRepository,
   deleteRepository,
+  scanRepository,
 } from '../api/index.js'
 
 const loading = ref(false)
+const scanningId = ref(null)
 const repos = ref([])
 
 // Dialog state
 const dialogVisible = ref(false)
 const dialogTitle = ref('')
 const isEditing = ref(false)
+const scanAfterCreate = ref(false)
 const form = reactive({
   id: null,
   name: '',
@@ -50,6 +53,7 @@ async function fetchRepos() {
 function openAddDialog() {
   isEditing.value = false
   dialogTitle.value = '添加仓库'
+  scanAfterCreate.value = false
   Object.assign(form, emptyForm())
   dialogVisible.value = true
 }
@@ -67,6 +71,30 @@ function openEditDialog(repo) {
   dialogVisible.value = true
 }
 
+async function handleScan(repo) {
+  scanningId.value = repo.id
+  try {
+    const res = await scanRepository(repo.id)
+    const data = res.data
+    if (data.status === 'success') {
+      const score = data.overall_score != null ? `${data.overall_score}/100` : 'N/A'
+      const risk = data.risk_level || 'unknown'
+      ElMessage.success({
+        message: `扫描完成 — 评分: ${score}, 风险: ${risk}, 评估文件数: ${data.files_evaluated}`,
+        duration: 6000,
+      })
+    } else if (data.status === 'failed') {
+      ElMessage.error('扫描失败: ' + (data.error || '未知错误'))
+    }
+    await fetchRepos()
+  } catch (e) {
+    ElMessage.error('扫描请求失败: ' + (e.response?.data?.detail || e.message))
+    await fetchRepos()
+  } finally {
+    scanningId.value = null
+  }
+}
+
 async function handleSubmit() {
   try {
     if (isEditing.value) {
@@ -82,15 +110,18 @@ async function handleSubmit() {
       await updateRepository(form.id, payload)
       ElMessage.success('仓库配置已更新')
     } else {
-      await createRepository({
+      const res = await createRepository({
         name: form.name,
         clone_url: form.clone_url || null,
         webhook_secret: form.webhook_secret || null,
         ssh_key_path: form.ssh_key_path || null,
         branch_filter: form.branch_filter || null,
         is_active: form.is_active,
-      })
-      ElMessage.success('仓库已添加')
+      }, { params: { scan: scanAfterCreate.value } })
+      const msg = scanAfterCreate.value && res.data?.scan
+        ? `仓库已添加，扫描${res.data.scan.status === 'success' ? '完成' : '失败'}`
+        : '仓库已添加'
+      ElMessage.success(msg)
     }
     dialogVisible.value = false
     await fetchRepos()
@@ -182,8 +213,18 @@ onMounted(fetchRepos)
             <span v-else style="color: var(--color-text-muted); font-size: 12px;">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="140" align="center" fixed="right">
+        <el-table-column label="操作" width="210" align="center" fixed="right">
           <template #default="{ row }">
+            <el-button
+              size="small"
+              text
+              type="primary"
+              :loading="scanningId === row.id"
+              :disabled="scanningId === row.id || !row.clone_url"
+              @click="handleScan(row)"
+            >
+              {{ scanningId === row.id ? '扫描中' : '扫描' }}
+            </el-button>
             <el-button size="small" text type="primary" @click="openEditDialog(row)">
               编辑
             </el-button>
@@ -239,6 +280,11 @@ onMounted(fetchRepos)
         </el-form-item>
         <el-form-item label="活跃">
           <el-switch v-model="form.is_active" />
+        </el-form-item>
+        <el-form-item v-if="!isEditing" label="初始扫描">
+          <el-checkbox v-model="scanAfterCreate">
+            注册后立即扫描所有 <code>.cs</code> 文件
+          </el-checkbox>
         </el-form-item>
       </el-form>
       <template #footer>
