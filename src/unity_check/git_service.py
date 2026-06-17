@@ -163,8 +163,14 @@ def get_diff(bare_repo_path: str, before_sha: str, after_sha: str) -> str:
 def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     """Generate a unified diff treating all tracked .cs files as new additions.
 
-    Uses ``git diff-tree -p --root <sha> -- <path>`` for each tracked ``.cs``
-    file so the output is a standard unified diff (``--- /dev/null`` /
+    Uses ``git diff-tree -p <empty_tree> <sha> -- <path>`` for each tracked
+    ``.cs`` file, comparing against the well-known Git empty tree SHA
+    (``4b825dc642cb6eb9a060e54bf899d15303643e6c``).  This guarantees that
+    **every** tracked ``.cs`` file appears as a full-file addition regardless
+    of whether the commit is a root commit or has parents — unlike
+    ``--root`` which only works for root commits.
+
+    The output is a standard unified diff (``--- /dev/null`` /
     ``+++ b/<path>``) that the existing evaluation pipeline
     (``extract_cs_files_from_diff`` / ``_extract_file_diff``) can process
     without modification.
@@ -172,6 +178,9 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     Returns an empty string when no ``.cs`` files are found.
     """
     import git
+
+    # The well-known empty tree SHA — every tracked file is "new" vs this.
+    _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf899d15303643e6c"
 
     if not os.path.isdir(bare_repo_path):
         raise GitServiceError(f"Bare repo not found: {bare_repo_path}")
@@ -196,11 +205,11 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
         logger.info("No .cs files found in commit %s", sha)
         return ""
 
-    # Generate a per-file diff from /dev/null
+    # Generate a per-file diff against the empty tree (full file as addition)
     diff_blocks: list[str] = []
     for fp in cs_files:
         try:
-            block = repo.git.diff_tree("-p", "--root", sha, "--", fp)
+            block = repo.git.diff_tree("-p", _EMPTY_TREE, sha, "--", fp)
             if block:
                 diff_blocks.append(block)
         except Exception as exc:
