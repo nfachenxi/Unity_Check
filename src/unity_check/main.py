@@ -4,8 +4,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
@@ -65,20 +64,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
-
-# ---------------------------------------------------------------------------
-# Production static file serving (frontend)
-# ---------------------------------------------------------------------------
-if settings.app_env == "production":
-    frontend_dist = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-        settings.frontend_dist_dir.lstrip("./"),
-    )
-    if os.path.isdir(frontend_dist):
-        logger.info("Mounting frontend static files from %s", frontend_dist)
-        app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
-    else:
-        logger.warning("frontend_dist_dir %s not found; frontend not served", frontend_dist)
 
 
 @app.get("/health")
@@ -817,3 +802,30 @@ def _stats_hotspots(limit: int, days: int, repository: str | None, db: Session) 
     )
     rows = db.execute(base).all()
     return [{"file": r[0], "count": r[1]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Production SPA fallback (MUST be last — catches unmatched paths only)
+# ---------------------------------------------------------------------------
+if settings.app_env == "production":
+    frontend_dist = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        settings.frontend_dist_dir.lstrip("./"),
+    )
+    if os.path.isdir(frontend_dist):
+        dist_index = os.path.join(frontend_dist, "index.html")
+        logger.info("Frontend dist found at %s; enabling SPA fallback", frontend_dist)
+
+        @app.get("/{full_path:path}")
+        async def serve_frontend(full_path: str) -> FileResponse:
+            """Serve static assets or fall back to index.html for SPA routing.
+
+            Only triggers when no explicit API route matches first.
+            """
+            file_path = os.path.join(frontend_dist, full_path)
+            if os.path.isfile(file_path):
+                return FileResponse(file_path)
+            return FileResponse(dist_index)
+
+    else:
+        logger.warning("frontend_dist_dir %s not found; frontend not served", frontend_dist)
