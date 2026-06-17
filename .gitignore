@@ -17,3 +17,13 @@ data/
 *.db
 repos
 .planning
+
+# Coverage
+.coverage
+
+# Windows-specific
+start_all.ps1
+
+# Archives
+*.zip
+*.tar.gz

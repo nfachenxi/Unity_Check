@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
     git_ssh_key_path: str | None = Field(default=None, alias="GIT_SSH_KEY_PATH")
 
+    frontend_dist_dir: str = Field(default="./frontend/dist", alias="FRONTEND_DIST_DIR")
+
 
 @lru_cache()
 def get_settings() -> Settings:

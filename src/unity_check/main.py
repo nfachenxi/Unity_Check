@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
@@ -64,6 +65,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# Production static file serving (frontend)
+# ---------------------------------------------------------------------------
+if settings.app_env == "production":
+    frontend_dist = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        settings.frontend_dist_dir.lstrip("./"),
+    )
+    if os.path.isdir(frontend_dist):
+        logger.info("Mounting frontend static files from %s", frontend_dist)
+        app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+    else:
+        logger.warning("frontend_dist_dir %s not found; frontend not served", frontend_dist)
 
 
 @app.get("/health")
