@@ -38,11 +38,51 @@ const routes = [
     component: () => import('../views/SettingsView.vue'),
     meta: { title: '全局配置' },
   },
+  {
+    path: '/lock',
+    name: 'LockScreen',
+    component: () => import('../views/LockScreen.vue'),
+    meta: { title: '验证' },
+  },
 ]
 
 const router = createRouter({
   history: createWebHistory(),
   routes,
+})
+
+const AUTH_KEY = 'unity_check_auth'
+
+function isAuthenticated() {
+  try {
+    const raw = localStorage.getItem(AUTH_KEY)
+    if (!raw) return false
+    const data = JSON.parse(raw)
+    return data.unlocked === true && data.expires_at > Date.now()
+  } catch {
+    return false
+  }
+}
+
+router.beforeEach((to, from, next) => {
+  // LockScreen is always accessible
+  if (to.name === 'LockScreen') {
+    // Already authenticated → redirect to home
+    if (isAuthenticated()) {
+      next('/')
+      return
+    }
+    next()
+    return
+  }
+
+  // All other routes require authentication
+  if (!isAuthenticated()) {
+    next({ name: 'LockScreen', query: { redirect: to.fullPath } })
+    return
+  }
+
+  next()
 })
 
 export default router

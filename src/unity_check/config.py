@@ -35,6 +35,8 @@ class Settings(BaseSettings):
 
     frontend_dist_dir: str = Field(default="./frontend/dist", alias="FRONTEND_DIST_DIR")
 
+    frontend_password: str | None = Field(default=None, alias="FRONTEND_PASSWORD")
+
     @field_validator("github_mirror_urls", mode="before")
     @classmethod
     def _parse_mirror_urls(cls, v: object) -> list[str]:

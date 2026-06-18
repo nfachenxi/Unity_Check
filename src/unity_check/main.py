@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -16,6 +18,9 @@ from unity_check.git_service import extract_sha_from_payload
 from unity_check.models import EvaluationRound, GithubEvent, Repository, SystemSetting, Task
 
 settings = get_settings()
+
+# In-memory login attempt tracking: IP -> {count, banned_until}
+_login_attempts: dict[str, dict] = {}
 
 logging.basicConfig(
     level=getattr(logging, settings.app_log_level.upper(), logging.INFO),
@@ -92,6 +97,52 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 def health_check(db: Session = Depends(get_db)) -> dict[str, str]:
     db.execute(text("SELECT 1"))
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Frontend authentication
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/auth/login")
+def frontend_login(body: dict, request: Request) -> dict:
+    """Verify frontend access password.
+
+    Rate-limited: 5 failed attempts per IP per hour.
+    Returns ``{"success": true}`` on valid password.
+    """
+    if not settings.frontend_password:
+        raise HTTPException(status_code=400, detail="系统未配置访问密码，请联系管理员在 .env 中设置 FRONTEND_PASSWORD")
+
+    password = body.get("password", "")
+    client_ip = request.client.host if request.client else "unknown"
+
+    now = time.time()
+    record = _login_attempts.get(client_ip)
+
+    # Check if currently banned
+    if record and record["banned_until"] > now:
+        remaining_secs = int(record["banned_until"] - now)
+        remaining_mins = max(1, remaining_secs // 60)
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录尝试过于频繁，请等待 {remaining_mins} 分钟后再试",
+        )
+
+    if password != settings.frontend_password:
+        # Record failed attempt
+        if record is None:
+            _login_attempts[client_ip] = {"count": 1, "banned_until": 0.0}
+        else:
+            record["count"] += 1
+            if record["count"] >= 5:
+                _login_attempts[client_ip]["banned_until"] = now + 3600
+
+        raise HTTPException(status_code=401, detail="密码错误")
+
+    # Success: reset counter
+    _login_attempts.pop(client_ip, None)
+    return {"success": True}
 
 
 @app.post("/webhook/github")

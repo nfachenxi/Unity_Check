@@ -88,4 +88,9 @@ export function updateSystemSettings(data) {
   return api.put('/system/settings', data)
 }
 
+// ---- Frontend Auth ----
+export function login(password) {
+  return api.post('/auth/login', { password })
+}
+
 export default api
