@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from typing import Any
 
 from unity_check.config import get_settings
@@ -11,6 +12,14 @@ from unity_check.config import get_settings
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+
+# How many clone/fetch attempts across all mirror candidates (including the
+# original URL as the final fallback).  Each attempt may try a different mirror.
+MAX_CLONE_ATTEMPTS = 3
+# Per-attempt timeout for ``git clone`` / ``git fetch``
+CLONE_TIMEOUT_SECONDS = 120
+# Per-mirror timeout for ``git ls-remote`` speed probe
+MIRROR_PROBE_TIMEOUT = 10
 
 
 class GitServiceError(Exception):
@@ -45,28 +54,174 @@ def resolve_bare_path(clone_url: str) -> str:
     return os.path.join(clone_base, f"{repo_dir}.git")
 
 
-def _apply_mirror(clone_url: str) -> str:
-    """If ``settings.github_mirror_url`` is set, rewrite the clone URL.
+def _probe_mirror_speed(mirror_base: str, clone_url: str) -> float | None:
+    """Measure a mirror's response time via ``git ls-remote``.
 
-    Only applies to ``https://github.com/`` URLs — SSH and other hosts
-    are returned unchanged.
+    Returns the elapsed time in seconds on success, or ``None`` if the
+    mirror is unreachable or times out (default: 10 s).
     """
-    mirror = settings.github_mirror_url
-    if not mirror or not clone_url:
-        return clone_url
-    if not clone_url.startswith("https://github.com/"):
-        return clone_url
-    mirrored = mirror.rstrip("/") + "/" + clone_url
-    logger.debug("Git mirror applied: %s -> %s", clone_url, mirrored)
-    return mirrored
+    mirrored_url = mirror_base.rstrip("/") + "/" + clone_url
+    start = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", mirrored_url],
+            capture_output=True,
+            timeout=MIRROR_PROBE_TIMEOUT,
+            text=True,
+        )
+        if result.returncode == 0:
+            elapsed = time.monotonic() - start
+            logger.debug("Mirror %s responded in %.2fs", mirror_base, elapsed)
+            return elapsed
+        logger.debug("Mirror %s ls-remote returned code %d", mirror_base, result.returncode)
+    except subprocess.TimeoutExpired:
+        logger.debug("Mirror %s timed out after %ds", mirror_base, MIRROR_PROBE_TIMEOUT)
+    except Exception as exc:
+        logger.debug("Mirror %s probe failed: %s", mirror_base, exc)
+    return None
+
+
+def _rank_mirror_candidates(clone_url: str) -> list[str]:
+    """Probe all configured mirrors and return candidate URLs, fastest first.
+
+    The returned list is capped at *MAX_CLONE_ATTEMPTS* entries.  The
+    original *clone_url* is always included as the final fallback.
+
+    When no mirrors are configured, returns ``[clone_url]`` immediately
+    (no probing).
+    """
+    cfg = get_settings()
+    if not cfg.github_mirror_urls:
+        return [clone_url]
+
+    # Probe every mirror in parallel-ish (sequential is fine for a small set)
+    responsive: list[tuple[float, str]] = []
+    unresponsive: list[str] = []
+    for mirror_base in cfg.github_mirror_urls:
+        mirrored_url = mirror_base.rstrip("/") + "/" + clone_url
+        latency = _probe_mirror_speed(mirror_base, clone_url)
+        if latency is not None:
+            responsive.append((latency, mirrored_url))
+        else:
+            unresponsive.append(mirrored_url)
+
+    # Sort responsive mirrors by latency (fastest first)
+    responsive.sort(key=lambda x: x[0])
+    candidates = [url for _, url in responsive] + unresponsive
+
+    # Cap: keep top (MAX_CLONE_ATTEMPTS - 1) mirrors, always include original
+    result = candidates[: MAX_CLONE_ATTEMPTS - 1]
+    if clone_url not in result:
+        result.append(clone_url)
+
+    logger.info(
+        "Mirror probe: %d responsive, %d unresponsive → %d candidate(s)",
+        len(responsive),
+        len(unresponsive),
+        len(result),
+    )
+    return result[:MAX_CLONE_ATTEMPTS]
+
+
+def _clone_with_fallback(bare_path: str, original_url: str, candidates: list[str]) -> None:
+    """Try ``git clone --bare`` with each candidate URL in order.
+
+    On failure the partial clone directory is cleaned up before the next
+    attempt.  Raises :class:`GitServiceError` when all candidates fail.
+    """
+    import git
+
+    last_error: Exception | None = None
+    for attempt, candidate_url in enumerate(candidates, 1):
+        logger.info(
+            "Clone attempt %d/%d: %s",
+            attempt,
+            len(candidates),
+            candidate_url,
+        )
+        try:
+            git.Repo.clone_from(candidate_url, bare_path, bare=True)
+            logger.info("Clone succeeded on attempt %d", attempt)
+            return
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Clone attempt %d/%d failed: %s", attempt, len(candidates), exc)
+            # Remove partial clone directory left by a failed attempt
+            if os.path.isdir(bare_path):
+                import shutil as _su
+
+                _su.rmtree(bare_path, ignore_errors=True)
+
+    raise GitServiceError(
+        f"Failed to clone bare repo from {original_url} after "
+        f"{len(candidates)} attempt(s): {last_error}"
+    ) from last_error
+
+
+def _fetch_with_fallback(bare_path: str, candidates: list[str]) -> None:
+    """Try ``git fetch`` on an existing bare repo with each candidate URL.
+
+    Each attempt updates the ``origin`` remote URL before fetching.  Raises
+    :class:`GitServiceError` when all candidates fail.
+    """
+    import git
+
+    repo = git.Repo(bare_path)
+    last_error: Exception | None = None
+
+    for attempt, candidate_url in enumerate(candidates, 1):
+        try:
+            # Update remote URL to the current candidate
+            current_url = _safe_cmd(lambda: repo.git.remote("get-url", "origin"))
+            if current_url != candidate_url:
+                repo.git.remote("set-url", "origin", candidate_url)
+
+            # Ensure fetch refspec is present (fresh bare clones may lack it)
+            has_refspec = _safe_cmd(
+                lambda: bool(repo.git.config("--get", "remote.origin.fetch"))
+            )
+            if not has_refspec:
+                repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
+
+            origin = repo.remote("origin")
+            origin.fetch()
+            logger.info("Fetch succeeded on attempt %d (%s)", attempt, candidate_url)
+            return
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Fetch attempt %d/%d failed: %s",
+                attempt,
+                len(candidates),
+                exc,
+            )
+
+    raise GitServiceError(
+        f"Failed to fetch bare repo at {bare_path} after "
+        f"{len(candidates)} attempt(s): {last_error}"
+    ) from last_error
+
+
+def _safe_cmd(fn):
+    """Run *fn*, returning its result or ``None`` on any exception."""
+    try:
+        return fn()
+    except Exception:
+        return None
 
 
 def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     """Clone a bare repo or fetch if it already exists.
 
-    When *ssh_key_path* is provided, the ``GIT_SSH_COMMAND``
-    environment variable is set for the duration of the operation,
-    allowing private-repo access via the specified SSH key.
+    When multiple GitHub mirrors are configured (via ``GITHUB_MIRROR_URLS``
+    in the environment / ``.env``), each is probed with ``git ls-remote``
+    and the fastest responsive mirror is preferred.  Up to
+    *MAX_CLONE_ATTEMPTS* mirrors (plus the original URL as the final
+    fallback) are tried in order before giving up.
+
+    When *ssh_key_path* is provided, the ``GIT_SSH_COMMAND`` environment
+    variable is set for the duration of the operation, allowing private-repo
+    access via the specified SSH key.
 
     Returns the absolute path to the bare repo directory.
     """
@@ -76,8 +231,8 @@ def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     repo_dir = _repo_name_from_url(clone_url)
     bare_path = os.path.join(clone_base, f"{repo_dir}.git")
 
-    # Apply GitHub mirror if configured (path uses original URL, git ops use effective)
-    effective_url = _apply_mirror(clone_url)
+    # Build candidate URLs: fastest mirrors first, original as fallback
+    candidates = _rank_mirror_candidates(clone_url)
 
     # Set up SSH command if key path provided (restore in finally block)
     _prev_ssh = os.environ.get("GIT_SSH_COMMAND")
@@ -89,38 +244,9 @@ def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     try:
         if os.path.isdir(bare_path):
             logger.info("Fetching existing bare repo: %s", bare_path)
-            try:
-                repo = git.Repo(bare_path)
-                try:
-                    has_refspec = bool(repo.git.config("--get", "remote.origin.fetch"))
-                except Exception:
-                    has_refspec = False
-                if not has_refspec:
-                    repo.git.remote("set-url", "origin", effective_url)
-                    repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
-                else:
-                    # Ensure remote URL respects mirror config
-                    current_url = repo.git.remote("get-url", "origin")
-                    if current_url != effective_url:
-                        repo.git.remote("set-url", "origin", effective_url)
-                origin = repo.remote("origin")
-                origin.fetch()
-            except Exception as exc:
-                raise GitServiceError(
-                    f"Failed to fetch bare repo at {bare_path}: {exc}"
-                ) from exc
+            _fetch_with_fallback(bare_path, candidates)
         else:
-            logger.info("Cloning bare repo: %s -> %s", effective_url, bare_path)
-            try:
-                git.Repo.clone_from(
-                    effective_url,
-                    bare_path,
-                    bare=True,
-                )
-            except Exception as exc:
-                raise GitServiceError(
-                    f"Failed to clone bare repo from {clone_url}: {exc}"
-                ) from exc
+            _clone_with_fallback(bare_path, clone_url, candidates)
     finally:
         if ssh_key_path:
             if _prev_ssh:
