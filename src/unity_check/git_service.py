@@ -136,7 +136,7 @@ def get_diff(bare_repo_path: str, before_sha: str, after_sha: str) -> str:
         logger.info("Null before_sha detected, diffing single commit %s", after_sha)
         try:
             if _sha_exists(after_sha):
-                return repo.git.diff_tree("-r", "-p", after_sha)
+                return repo.git.diff_tree("-r", "-p", "--root", after_sha)
             else:
                 logger.warning("after_sha not found in repo: %s", after_sha)
                 return ""
@@ -174,12 +174,13 @@ def _object_exists(repo, sha: str) -> bool:
 def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     """Generate a unified diff treating all tracked .cs files as new additions.
 
-    Uses ``git diff-tree -p <empty_tree> <sha> -- <path>`` for each tracked
-    ``.cs`` file, comparing against the well-known Git empty tree SHA
-    (``4b825dc642cb6eb9a060e54bf899d15303643e6c``).  This guarantees that
-    **every** tracked ``.cs`` file appears as a full-file addition regardless
-    of whether the commit is a root commit or has parents — unlike
-    ``--root`` which only works for root commits.
+    For each tracked ``.cs`` file in the commit, extracts the full file
+    content and formats it as a unified diff against ``/dev/null``.  Unlike
+    the well-known empty-tree-SHA approach (``4b825dc642cb6eb9a060e54bf899d15303643e6c``),
+    this does **not** depend on a special Git object existing in the bare
+    repository — it reads file content directly via the GitPython blob API,
+    making it reliable in any repository state (fresh clone, bare repo,
+    shallow clone, etc.).
 
     The output is a standard unified diff (``--- /dev/null`` /
     ``+++ b/<path>``) that the existing evaluation pipeline
@@ -189,9 +190,6 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     Returns an empty string when no ``.cs`` files are found.
     """
     import git
-
-    # The well-known empty tree SHA — every tracked file is "new" vs this.
-    _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf899d15303643e6c"
 
     if not os.path.isdir(bare_repo_path):
         raise GitServiceError(f"Bare repo not found: {bare_repo_path}")
@@ -207,24 +205,6 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
     except Exception as exc:
         raise GitServiceError(f"Commit {sha} not found in bare repo: {exc}") from exc
 
-    # Ensure the empty tree object exists in the object database
-    # (4b825dc642cb6eb9a060e54bf899d15303643e6c is the well-known SHA for an
-    # empty tree, but it's not guaranteed to be present in every bare repo).
-    if not _object_exists(repo, _EMPTY_TREE):
-        logger.info("Empty tree object not found — creating it in %s", bare_repo_path)
-        try:
-            subprocess.run(
-                ["git", "--git-dir", bare_repo_path, "hash-object", "-t", "tree", "--stdin", "-w"],
-                capture_output=True,
-                input=b"",
-                timeout=30,
-                check=True,
-            )
-        except Exception as exc:
-            raise GitServiceError(
-                f"Failed to create empty tree object in {bare_repo_path}: {exc}"
-            ) from exc
-
     # List all tracked .cs files in this commit's tree
     cs_files = sorted(
         b.path for b in commit.tree.traverse()
@@ -234,15 +214,41 @@ def generate_full_cs_diff(bare_repo_path: str, sha: str) -> str:
         logger.info("No .cs files found in commit %s", sha)
         return ""
 
-    # Generate a per-file diff against the empty tree (full file as addition)
+    # For each .cs file, get the full content and format as a unified diff
+    # against /dev/null (all files appear as new additions).
+    #
+    # This approach is more reliable than diff-tree against the empty tree
+    # hash because the empty tree object (4b825dc...) is NOT guaranteed to
+    # exist in bare repositories — and even when explicitly created, it can
+    # still be invisible to subsequent GitPython diff-tree calls.
     diff_blocks: list[str] = []
     for fp in cs_files:
         try:
-            block = repo.git.diff_tree("-p", _EMPTY_TREE, sha, "--", fp)
-            if block:
-                diff_blocks.append(block)
+            blob = commit.tree / fp
+            raw = blob.data_stream.read()
+            content = raw.decode("utf-8", errors="replace")
+            lines = content.split("\n")
+            # Remove trailing empty line produced by split for trailing newlines
+            if lines and lines[-1] == "":
+                lines = lines[:-1]
+
+            diff_block = (
+                f"diff --git a/{fp} b/{fp}\n"
+                f"new file mode 100644\n"
+                f"index 0000000..{blob.hexsha}\n"
+                f"--- /dev/null\n"
+                f"+++ b/{fp}\n"
+                f"@@ -0,0 +1,{len(lines)} @@\n"
+            )
+            for line in lines:
+                diff_block += f"+{line}\n"
+
+            diff_blocks.append(diff_block)
         except Exception as exc:
-            logger.warning("Failed to diff %s from commit %s: %s", fp, sha, exc)
+            logger.warning(
+                "Failed to extract content for %s from commit %s: %s",
+                fp, sha, exc,
+            )
             continue
 
     if not diff_blocks:
