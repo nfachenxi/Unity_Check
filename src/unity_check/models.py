@@ -17,6 +17,7 @@ class Repository(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    alias: Mapped[str | None] = mapped_column(String(255))
     clone_url: Mapped[str | None] = mapped_column(String(1024))
     webhook_secret: Mapped[str | None] = mapped_column(String(128))
     ssh_key_path: Mapped[str | None] = mapped_column(String(512))

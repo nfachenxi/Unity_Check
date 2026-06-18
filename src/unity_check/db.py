@@ -65,3 +65,11 @@ def run_migrations() -> None:
             conn.commit()
 
     # (future migrations go here)
+
+    # --- migration: add alias to repositories ---
+    repo_cols = {c["name"] for c in inspector.get_columns("repositories")}
+    if "alias" not in repo_cols:
+        logger.info("Migration: adding alias column to repositories")
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE repositories ADD COLUMN alias VARCHAR(255)"))
+            conn.commit()

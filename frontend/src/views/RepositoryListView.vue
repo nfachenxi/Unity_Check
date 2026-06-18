@@ -25,6 +25,7 @@ const scanAfterCreate = ref(false)
 const form = reactive({
   id: null,
   name: '',
+  alias: '',
   clone_url: '',
   webhook_secret: '',
   ssh_key_path: '',
@@ -35,6 +36,7 @@ const form = reactive({
 const emptyForm = () => ({
   id: null,
   name: '',
+  alias: '',
   clone_url: '',
   webhook_secret: '',
   ssh_key_path: '',
@@ -120,6 +122,7 @@ function openEditDialog(repo) {
   dialogTitle.value = '编辑仓库'
   form.id = repo.id
   form.name = repo.name
+  form.alias = repo.alias || ''
   form.clone_url = repo.clone_url || ''
   form.webhook_secret = ''
   form.ssh_key_path = repo.ssh_key_path || ''
@@ -156,6 +159,7 @@ async function handleSubmit() {
   try {
     if (isEditing.value) {
       const payload = {
+        alias: form.alias || null,
         clone_url: form.clone_url || null,
         ssh_key_path: form.ssh_key_path || null,
         branch_filter: form.branch_filter || null,
@@ -169,6 +173,7 @@ async function handleSubmit() {
     } else {
       const res = await createRepository({
         name: form.name,
+        alias: form.alias || null,
         clone_url: form.clone_url || null,
         webhook_secret: form.webhook_secret || null,
         ssh_key_path: form.ssh_key_path || null,
@@ -269,7 +274,13 @@ onUnmounted(() => {
         size="default"
         style="width: 100%"
       >
-        <el-table-column prop="name" label="仓库名称" min-width="200" show-overflow-tooltip />
+        <el-table-column label="仓库名称" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.alias" style="font-weight: 500;">{{ row.alias }}</span>
+            <span v-else style="font-weight: 500;">{{ row.name }}</span>
+            <span v-if="row.alias" style="color: var(--color-text-muted); font-size: 12px; margin-left: 6px;">({{ row.name }})</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="status" label="状态" width="100" align="center">
           <template #default="{ row }">
             <el-tag :type="statusTagType(row.status)" size="small" effect="dark">
@@ -345,6 +356,12 @@ onUnmounted(() => {
             v-model="form.name"
             placeholder="owner/repo"
             :disabled="isEditing"
+          />
+        </el-form-item>
+        <el-form-item label="仓库别名">
+          <el-input
+            v-model="form.alias"
+            placeholder="友好名称，如「主游戏项目」（可选）"
           />
         </el-form-item>
         <el-form-item label="Clone URL">

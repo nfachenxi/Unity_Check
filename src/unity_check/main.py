@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 class RepositoryCreate(BaseModel):
     """Request body for POST /api/repositories."""
     name: str
+    alias: str | None = None
     clone_url: str | None = None
     webhook_secret: str | None = None
     ssh_key_path: str | None = None
@@ -36,6 +37,7 @@ class RepositoryCreate(BaseModel):
 
 class RepositoryUpdate(BaseModel):
     """Request body for PUT /api/repositories/{id}."""
+    alias: str | None = None
     clone_url: str | None = None
     webhook_secret: str | None = None
     ssh_key_path: str | None = None
@@ -457,6 +459,7 @@ def _repo_to_dict(repo: Repository) -> dict:
     return {
         "id": repo.id,
         "name": repo.name,
+        "alias": repo.alias,
         "clone_url": repo.clone_url,
         "ssh_key_path": repo.ssh_key_path,
         "branch_filter": repo.branch_filter,
@@ -495,6 +498,7 @@ def create_repository_api(
         repo = repository_service.create_repository(
             db,
             name=body.name,
+            alias=body.alias,
             clone_url=body.clone_url,
             webhook_secret=body.webhook_secret,
             ssh_key_path=body.ssh_key_path,
@@ -918,6 +922,57 @@ def _stats_hotspots(limit: int, days: int, repository: str | None, db: Session) 
     )
     rows = db.execute(base).all()
     return [{"file": r[0], "count": r[1]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# System
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/system/reset")
+def reset_system(db: Session = Depends(get_db)) -> dict:
+    """Reset the entire system to initial state.
+
+    Clears all data: evaluation rounds, events, tasks, repositories,
+    and deletes all cloned bare repos from disk. Schema is preserved.
+    """
+    import shutil
+
+    logger.warning("System reset requested — clearing all data")
+
+    # 1. Delete evaluation rounds (cascade-safe: direct delete)
+    db.query(EvaluationRound).delete()
+    db.flush()
+
+    # 2. Delete all events
+    db.query(GithubEvent).delete()
+    db.flush()
+
+    # 3. Delete all tasks
+    db.query(Task).delete()
+    db.flush()
+
+    # 4. Delete all repositories
+    db.query(Repository).delete()
+    db.flush()
+
+    db.commit()
+    logger.info("All database records cleared.")
+
+    # 5. Delete all cloned bare repos from disk
+    clone_base = os.path.abspath(settings.git_clone_base_dir)
+    if os.path.isdir(clone_base):
+        for entry in os.listdir(clone_base):
+            entry_path = os.path.join(clone_base, entry)
+            try:
+                if os.path.isdir(entry_path):
+                    shutil.rmtree(entry_path)
+                    logger.info("Deleted repo directory: %s", entry_path)
+            except Exception as exc:
+                logger.warning("Failed to delete %s: %s", entry_path, exc)
+
+    logger.warning("System reset completed.")
+    return {"status": "ok", "message": "系统已重置，所有数据已清除"}
 
 
 # ---------------------------------------------------------------------------

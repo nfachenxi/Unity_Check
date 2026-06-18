@@ -14,6 +14,7 @@ from unity_check.models import Repository
 logger = logging.getLogger(__name__)
 
 _ALLOWED_UPDATE_FIELDS = {
+    "alias",
     "clone_url",
     "webhook_secret",
     "ssh_key_path",
@@ -29,6 +30,7 @@ _ALLOWED_UPDATE_FIELDS = {
 def create_repository(
     db: Session,
     name: str,
+    alias: str | None = None,
     clone_url: str | None = None,
     webhook_secret: str | None = None,
     ssh_key_path: str | None = None,
@@ -44,6 +46,7 @@ def create_repository(
 
     repo = Repository(
         name=name,
+        alias=alias,
         clone_url=clone_url,
         webhook_secret=webhook_secret,
         ssh_key_path=ssh_key_path,

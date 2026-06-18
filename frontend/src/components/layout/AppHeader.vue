@@ -1,6 +1,8 @@
 <script setup>
 import { useRoute, useRouter } from 'vue-router'
 import { computed } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { resetSystem } from '../../api/index.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,6 +26,34 @@ const breadcrumb = computed(() => {
 function refresh() {
   router.go(0)
 }
+
+async function handleReset() {
+  try {
+    await ElMessageBox.confirm(
+      '确定要重置整个系统吗？此操作将：<br><br>' +
+      '• 删除所有注册的仓库<br>' +
+      '• 删除所有事件和评估记录<br>' +
+      '• 删除所有扫描任务<br>' +
+      '• 删除所有克隆的仓库文件<br><br>' +
+      '<strong style="color: var(--color-critical);">此操作不可撤销！</strong>',
+      '重置系统',
+      {
+        confirmButtonText: '确认重置',
+        cancelButtonText: '取消',
+        type: 'warning',
+        dangerouslyUseHTMLString: true,
+        confirmButtonClass: 'reset-confirm-btn',
+      }
+    )
+    await resetSystem()
+    ElMessage.success('系统已重置，即将刷新页面')
+    setTimeout(() => router.go(0), 1500)
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') {
+      ElMessage.error('重置失败: ' + (e.response?.data?.detail || e.message))
+    }
+  }
+}
 </script>
 
 <template>
@@ -41,6 +71,11 @@ function refresh() {
     </div>
     <div class="header-spacer"></div>
     <div class="header-actions">
+      <el-tooltip content="重置系统" placement="bottom">
+        <el-icon :size="18" class="action-btn action-btn-danger" @click="handleReset">
+          <Delete />
+        </el-icon>
+      </el-tooltip>
       <el-tooltip content="刷新页面" placement="bottom">
         <el-icon :size="18" class="action-btn" @click="refresh">
           <Refresh />
@@ -99,5 +134,14 @@ function refresh() {
 .action-btn:hover {
   color: var(--color-primary);
   transform: rotate(90deg);
+}
+
+.action-btn-danger {
+  color: var(--color-text-muted);
+}
+
+.action-btn-danger:hover {
+  color: var(--color-critical);
+  transform: none;
 }
 </style>

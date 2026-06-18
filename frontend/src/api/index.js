@@ -74,4 +74,9 @@ export function getTask(id) {
   return api.get(`/tasks/${id}`)
 }
 
+// ---- System ----
+export function resetSystem() {
+  return api.post('/system/reset')
+}
+
 export default api
