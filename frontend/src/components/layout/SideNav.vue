@@ -23,7 +23,7 @@ const navItems = [
   <div class="sidenav" :class="{ collapsed }">
     <!-- Brand -->
     <div class="sidenav-brand">
-      <div class="brand-logo">UC</div>
+      <img class="brand-logo" src="/logo.png" alt="Unity Check" width="32" height="32" />
       <transition name="fade">
         <span v-if="!collapsed" class="brand-text">Unity Check</span>
       </transition>
@@ -87,14 +87,7 @@ const navItems = [
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  background: linear-gradient(135deg, var(--color-primary), var(--color-primary-dark));
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-heading);
-  font-size: 13px;
-  font-weight: 700;
-  color: #fff;
+  object-fit: cover;
   flex-shrink: 0;
 }
 
