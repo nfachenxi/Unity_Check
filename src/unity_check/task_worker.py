@@ -86,18 +86,18 @@ def _fail_task(db, task_pk: int, message: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _process_full_scan(task: Task) -> None:
+def _process_full_scan(task_id: int, repo_id: int) -> None:
     """Full scan: clone/fetch bare repo → full diff → evaluation pipeline.
 
     Used for both initial scan-on-create and manual scan.
     """
-    logger.info("Starting full_scan task %d for repo %s", task.id, task.repository_id)
+    logger.info("Starting full_scan task %d for repo %s", task_id, repo_id)
     db = SessionLocal()
     try:
-        pk = task.id
+        pk = task_id
         _update_task_progress(db, pk, "正在克隆仓库...")
 
-        repo = db.scalar(select(Repository).where(Repository.id == task.repository_id))
+        repo = db.scalar(select(Repository).where(Repository.id == repo_id))
         if repo is None:
             _fail_task(db, pk, "仓库不存在")
             return
@@ -161,10 +161,10 @@ def _process_full_scan(task: Task) -> None:
             .values(status="completed", progress_detail="扫描完成")
         )
         db.commit()
-        logger.info("Full_scan task %d completed (event %d)", task.id, event.id)
+        logger.info("Full_scan task %d completed (event %d)", task_id, event.id)
 
     except Exception as exc:
-        logger.exception("Full_scan task %d failed", task.id)
+        logger.exception("Full_scan task %d failed", task_id)
         try:
             _fail_task(db, pk, str(exc))
             db.commit()
@@ -179,23 +179,23 @@ def _process_full_scan(task: Task) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _process_incremental_scan(task: Task) -> None:
+def _process_incremental_scan(task_id: int, event_id: int | None, repo_id: int | None) -> None:
     """Incremental scan: fetch → delta diff → evaluation pipeline."""
-    logger.info("Starting incremental_scan task %d for event %s", task.id, task.event_id)
+    logger.info("Starting incremental_scan task %d for event %s", task_id, event_id)
     db = SessionLocal()
     event: GithubEvent | None = None
     repo: Repository | None = None
     try:
-        pk = task.id
+        pk = task_id
         _update_task_progress(db, pk, "正在拉取仓库更新...")
 
-        event = db.scalar(select(GithubEvent).where(GithubEvent.id == task.event_id))
+        event = db.scalar(select(GithubEvent).where(GithubEvent.id == event_id))
         if event is None:
             _fail_task(db, pk, "事件不存在")
             return
 
-        if task.repository_id:
-            repo = db.scalar(select(Repository).where(Repository.id == task.repository_id))
+        if repo_id:
+            repo = db.scalar(select(Repository).where(Repository.id == repo_id))
 
         # --- Git operations ---
         clone_url = extract_clone_url_from_payload(event.payload)
@@ -241,12 +241,12 @@ def _process_incremental_scan(task: Task) -> None:
             .values(status="completed", progress_detail="扫描完成")
         )
         db.commit()
-        logger.info("Incremental_scan task %d completed (event %d)", task.id, event.id)
+        logger.info("Incremental_scan task %d completed (event %d)", task_id, event.id)
 
     except Exception as exc:
-        logger.exception("Incremental_scan task %d failed", task.id)
+        logger.exception("Incremental_scan task %d failed", task_id)
         try:
-            _fail_task(db, task.id, str(exc))
+            _fail_task(db, task_id, str(exc))
             # Also mark the GithubEvent as failed
             if event and event.id:
                 db.execute(
@@ -290,30 +290,40 @@ def run_worker() -> None:
             )
 
             if task is not None:
+                # Extract all needed values BEFORE commit
+                # (SQLAlchemy commit expires ORM attributes; access after close crashes)
+                task_id = task.id
+                task_type = task.type
+                repo_id = task.repository_id
+                event_id = task.event_id
+
                 # Atomically claim the task
                 task.status = "processing"
                 db.commit()
                 db.close()
+                db = None  # Prevent double-close in outer except
 
-                # Process in its own session
-                if task.type == "full_scan":
-                    _process_full_scan(task)
-                elif task.type == "incremental_scan":
-                    _process_incremental_scan(task)
+                # Process in its own session (handlers create their own)
+                if task_type == "full_scan":
+                    _process_full_scan(task_id, repo_id)
+                elif task_type == "incremental_scan":
+                    _process_incremental_scan(task_id, event_id, repo_id)
                 else:
-                    logger.warning("Unknown task type: %s", task.type)
+                    logger.warning("Unknown task type: %s", task_type)
                     db2 = SessionLocal()
                     try:
-                        _fail_task(db2, task.id, f"Unknown type: {task.type}")
+                        _fail_task(db2, task_id, f"Unknown type: {task_type}")
                     finally:
                         db2.close()
             else:
                 db.close()
+                db = None
 
         except Exception:
             logger.exception("Task worker loop error")
             try:
-                db.close()
+                if db is not None:
+                    db.close()
             except Exception:
                 pass
 
