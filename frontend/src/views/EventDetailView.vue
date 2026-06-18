@@ -170,7 +170,11 @@ onMounted(fetchData)
             {{ event.event_type === 'push' ? 'Push' : 'Pull Request' }}
           </el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="仓库">{{ event.repository || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="仓库">
+          <span v-if="event.repository_alias" style="font-weight: 500;">{{ event.repository_alias }}</span>
+          <span v-if="event.repository_alias" style="color: var(--color-text-muted); font-size: 12px; margin-left: 4px;">({{ event.repository }})</span>
+          <span v-else>{{ event.repository || '-' }}</span>
+        </el-descriptions-item>
         <el-descriptions-item label="状态">
           <el-tag :type="event.status === 'success' ? 'success' : event.status === 'failed' ? 'danger' : 'info'" size="small">
             {{ event.status }}

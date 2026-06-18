@@ -39,7 +39,11 @@ function goDetail(id) {
       </el-table-column>
       <el-table-column prop="repository" label="仓库" min-width="120">
         <template #default="{ row }">
-          <span class="repo-name">{{ row.repository }}</span>
+          <div v-if="row.repository_alias" class="repo-cell">
+            <span class="repo-alias-name">{{ row.repository_alias }}</span>
+            <span class="repo-sub-name">({{ row.repository }})</span>
+          </div>
+          <span v-else class="repo-name">{{ row.repository }}</span>
         </template>
       </el-table-column>
       <el-table-column prop="overall_score" label="评分" width="60" align="center">
@@ -72,6 +76,23 @@ function goDetail(id) {
 .repo-name {
   color: var(--color-text-secondary);
   font-size: 13px;
+}
+
+.repo-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.repo-alias-name {
+  font-weight: 500;
+  color: var(--color-text);
+  font-size: 13px;
+}
+
+.repo-sub-name {
+  color: var(--color-text-muted);
+  font-size: 12px;
 }
 
 .score-good { color: var(--color-success); font-family: var(--font-heading); font-weight: 600; }

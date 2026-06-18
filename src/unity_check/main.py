@@ -201,7 +201,9 @@ def get_events_paginated(
     page_size = max(1, min(page_size, 100))
     offset = (page - 1) * page_size
 
-    base = select(GithubEvent)
+    base = select(GithubEvent, Repository.alias).outerjoin(
+        Repository, GithubEvent.repository == Repository.name
+    )
     count_base = select(func.count(GithubEvent.id))
 
     if event_type:
@@ -221,7 +223,7 @@ def get_events_paginated(
     total_pages = max(1, (total + page_size - 1) // page_size)
 
     order = GithubEvent.created_at.desc() if sort == "desc" else GithubEvent.created_at.asc()
-    rows = db.scalars(
+    rows = db.execute(
         base.order_by(order).limit(page_size).offset(offset)
     ).all()
 
@@ -232,6 +234,7 @@ def get_events_paginated(
             "event_type": item.event_type,
             "action": item.action,
             "repository": item.repository,
+            "repository_alias": alias,
             "after_sha": item.after_sha,
             "diff_size": item.diff_size,
             "status": item.status,
@@ -242,7 +245,7 @@ def get_events_paginated(
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         }
-        for item in rows
+        for item, alias in rows
     ]
 
     return {
@@ -269,12 +272,19 @@ def get_event_detail(
     if event is None:
         raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
 
+    # Look up repo alias
+    alias = None
+    if event.repository:
+        repo = db.scalar(select(Repository).where(Repository.name == event.repository))
+        alias = repo.alias if repo else None
+
     result = {
         "id": event.id,
         "delivery_id": event.delivery_id,
         "event_type": event.event_type,
         "action": event.action,
         "repository": event.repository,
+        "repository_alias": alias,
         "after_sha": event.after_sha,
         "before_sha": event.before_sha,
         "clone_path": event.clone_path,
@@ -743,6 +753,13 @@ def _dashboard_summary(days: int, repository: str | None, db: Session) -> dict:
 
     events = db.scalars(base.order_by(GithubEvent.created_at.desc())).all()
 
+    # Build repo alias lookup cache
+    all_repos = db.scalars(select(Repository)).all()
+    alias_map: dict[str, str | None] = {}
+    for r in all_repos:
+        if r.alias:
+            alias_map[r.name] = r.alias
+
     total = len(events)
     risk_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
@@ -763,6 +780,7 @@ def _dashboard_summary(days: int, repository: str | None, db: Session) -> dict:
             "id": e.id,
             "event_type": e.event_type,
             "repository": e.repository,
+            "repository_alias": alias_map.get(e.repository) if e.repository else None,
             "status": e.status,
             "overall_score": e.overall_score,
             "final_risk_level": e.final_risk_level,

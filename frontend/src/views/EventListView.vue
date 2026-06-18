@@ -136,7 +136,11 @@ onMounted(fetchEvents)
         </el-table-column>
         <el-table-column prop="repository" label="仓库" min-width="160">
           <template #default="{ row }">
-            <span class="mono-text">{{ row.repository || '-' }}</span>
+            <div v-if="row.repository_alias" class="repo-cell">
+              <span class="repo-alias">{{ row.repository_alias }}</span>
+              <span class="repo-name">({{ row.repository }})</span>
+            </div>
+            <span v-else class="mono-text">{{ row.repository || '-' }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="after_sha" label="Commit" width="110">
@@ -209,6 +213,23 @@ onMounted(fetchEvents)
   font-family: var(--font-heading);
   font-size: 13px;
   color: var(--color-text-secondary);
+}
+
+.repo-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.repo-alias {
+  font-weight: 500;
+  color: var(--color-text);
+  font-size: 13px;
+}
+
+.repo-name {
+  color: var(--color-text-muted);
+  font-size: 12px;
 }
 
 .sha-code {
