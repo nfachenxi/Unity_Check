@@ -13,7 +13,7 @@ from unity_check import repository_service, webhook_service
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db, run_migrations
 from unity_check.git_service import extract_sha_from_payload
-from unity_check.models import EvaluationRound, GithubEvent, Repository, Task
+from unity_check.models import EvaluationRound, GithubEvent, Repository, SystemSetting, Task
 
 settings = get_settings()
 
@@ -44,6 +44,25 @@ class RepositoryUpdate(BaseModel):
     branch_filter: str | None = None
     is_active: bool | None = None
     status: str | None = None
+
+
+def _resolve_webhook_secret(repo: Repository, db: Session) -> str | None:
+    """Determine effective webhook secret for a repository.
+
+    Resolution order:
+    1. Repo-level ``webhook_secret=""`` (empty string) → explicitly no secret.
+    2. Repo-level ``webhook_secret`` is a non-empty string → custom secret.
+    3. Repo-level ``webhook_secret`` is ``None`` → generic secret (DB override, then ``.env``).
+    """
+    if repo.webhook_secret == "":
+        return None
+    if repo.webhook_secret is not None:
+        return repo.webhook_secret
+    # Fallback to generic secret: DB override > env
+    setting = db.scalar(select(SystemSetting).where(SystemSetting.key == "generic_webhook_secret"))
+    if setting and setting.value:
+        return setting.value
+    return settings.generic_webhook_secret
 
 
 @asynccontextmanager
@@ -128,13 +147,15 @@ async def receive_github_webhook(
             raise HTTPException(status_code=403, detail=f"Repository '{repository}' is disabled.")
 
     # --- Signature verification ---
-    if repo_obj and repo_obj.webhook_secret:
-        if not x_hub_signature_256:
-            raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
-        if not webhook_service.verify_webhook_signature(
-            payload_bytes, repo_obj.webhook_secret, x_hub_signature_256
-        ):
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    if repo_obj:
+        secret = _resolve_webhook_secret(repo_obj, db)
+        if secret:
+            if not x_hub_signature_256:
+                raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
+            if not webhook_service.verify_webhook_signature(
+                payload_bytes, secret, x_hub_signature_256
+            ):
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     # --- Branch filtering (push only) ---
     if repo_obj and repo_obj.branch_filter and event_type == "push":
@@ -465,12 +486,21 @@ def re_evaluate_event(event_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 def _repo_to_dict(repo: Repository) -> dict:
-    """Serialize a Repository to a safe API response dict (no secret)."""
+    """Serialize a Repository to a safe API response dict (no secret value exposed)."""
+    # webhook_secret_type: "custom" | "none" | "generic"
+    if repo.webhook_secret == "":
+        secret_type = "none"
+    elif repo.webhook_secret is not None:
+        secret_type = "custom"
+    else:
+        secret_type = "generic"
+
     return {
         "id": repo.id,
         "name": repo.name,
         "alias": repo.alias,
         "clone_url": repo.clone_url,
+        "webhook_secret_type": secret_type,
         "ssh_key_path": repo.ssh_key_path,
         "branch_filter": repo.branch_filter,
         "is_active": repo.is_active,
@@ -991,6 +1021,58 @@ def reset_system(db: Session = Depends(get_db)) -> dict:
 
     logger.warning("System reset completed.")
     return {"status": "ok", "message": "系统已重置，所有数据已清除"}
+
+
+# ---------------------------------------------------------------------------
+# System settings (global config)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/system/settings")
+def get_system_settings(db: Session = Depends(get_db)) -> dict:
+    """Get global system settings.
+
+    Returns runtime values (DB override if set, otherwise ``.env`` fallback).
+    The actual webhook secret is **not** returned — only whether it is set.
+    """
+    setting = db.scalar(select(SystemSetting).where(SystemSetting.key == "generic_webhook_secret"))
+    effective_secret = setting.value if (setting and setting.value) else settings.generic_webhook_secret
+
+    ssh_setting = db.scalar(select(SystemSetting).where(SystemSetting.key == "generic_ssh_key_path"))
+    effective_ssh = ssh_setting.value if (ssh_setting and ssh_setting.value) else (settings.git_ssh_key_path or "")
+
+    return {
+        "generic_webhook_secret_set": bool(effective_secret),
+        "generic_ssh_key_path": effective_ssh,
+    }
+
+
+@app.put("/api/system/settings")
+def update_system_settings(body: dict, db: Session = Depends(get_db)) -> dict:
+    """Update global system settings.
+
+    Accepted keys: ``generic_webhook_secret``, ``generic_ssh_key_path``.
+    Send ``""`` (empty string) to clear a value and fall back to ``.env``.
+    """
+    allowed_keys = {"generic_webhook_secret", "generic_ssh_key_path"}
+
+    for key, value in body.items():
+        if key not in allowed_keys:
+            continue
+        if not value:
+            # Clear DB override → fallback to .env
+            existing = db.scalar(select(SystemSetting).where(SystemSetting.key == key))
+            if existing:
+                db.delete(existing)
+        else:
+            setting = db.scalar(select(SystemSetting).where(SystemSetting.key == key))
+            if setting:
+                setting.value = value
+            else:
+                db.add(SystemSetting(key=key, value=value))
+
+    db.commit()
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

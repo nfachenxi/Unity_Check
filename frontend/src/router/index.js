@@ -32,6 +32,12 @@ const routes = [
     component: () => import('../views/RepositoryListView.vue'),
     meta: { title: '仓库管理' },
   },
+  {
+    path: '/settings',
+    name: 'Settings',
+    component: () => import('../views/SettingsView.vue'),
+    meta: { title: '全局配置' },
+  },
 ]
 
 const router = createRouter({

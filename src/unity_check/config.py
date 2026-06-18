@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     git_clone_base_dir: str = Field(default="./repos", alias="GIT_CLONE_BASE_DIR")
     git_ssh_key_path: str | None = Field(default=None, alias="GIT_SSH_KEY_PATH")
 
+    generic_webhook_secret: str | None = Field(default=None, alias="GENERIC_WEBHOOK_SECRET")
+
     # GitHub mirrors (comma-separated in env, e.g. GITHUB_MIRROR_URLS=https://a.com,https://b.com)
     # Order does not matter — the fastest is auto-selected before each clone.
     github_mirror_urls: list[str] = Field(default_factory=list, alias="GITHUB_MIRROR_URLS")

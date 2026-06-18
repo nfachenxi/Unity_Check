@@ -1,5 +1,5 @@
 <script setup>
-import { reactive, ref, onMounted, onUnmounted } from 'vue'
+import { reactive, ref, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getRepositories,
@@ -28,6 +28,7 @@ const form = reactive({
   alias: '',
   clone_url: '',
   webhook_secret: '',
+  webhook_secret_mode: 'generic',
   ssh_key_path: '',
   branch_filter: '',
   is_active: true,
@@ -39,9 +40,28 @@ const emptyForm = () => ({
   alias: '',
   clone_url: '',
   webhook_secret: '',
+  webhook_secret_mode: 'generic',
   ssh_key_path: '',
   branch_filter: '',
   is_active: true,
+})
+
+// ---- Auto-fill name from clone_url ----
+
+function parseRepoNameFromUrl(url) {
+  if (!url) return ''
+  let m = url.match(/https?:\/\/(?:[^/]+)\/([^/]+?)\/([^/]+?)(?:\.git)?\/?$/)
+  if (m) return `${m[1]}/${m[2]}`
+  m = url.match(/git@[^:]+:([^/]+)\/([^/]+?)(?:\.git)?\/?$/)
+  if (m) return `${m[1]}/${m[2]}`
+  return ''
+}
+
+watch(() => form.clone_url, (newUrl) => {
+  if (newUrl && !form.name) {
+    const parsed = parseRepoNameFromUrl(newUrl)
+    if (parsed) form.name = parsed
+  }
 })
 
 // ---- Task polling helpers ----
@@ -125,6 +145,7 @@ function openEditDialog(repo) {
   form.alias = repo.alias || ''
   form.clone_url = repo.clone_url || ''
   form.webhook_secret = ''
+  form.webhook_secret_mode = repo.webhook_secret_type || 'generic'
   form.ssh_key_path = repo.ssh_key_path || ''
   form.branch_filter = repo.branch_filter || ''
   form.is_active = repo.is_active
@@ -157,29 +178,41 @@ async function handleScan(repo) {
 async function handleSubmit() {
   submitting.value = true
   try {
+    const payload = {
+      alias: form.alias || null,
+      clone_url: form.clone_url || null,
+      ssh_key_path: form.ssh_key_path || null,
+      branch_filter: form.branch_filter || null,
+      is_active: form.is_active,
+    }
+
+    // Webhook secret: three-state mode
     if (isEditing.value) {
-      const payload = {
-        alias: form.alias || null,
-        clone_url: form.clone_url || null,
-        ssh_key_path: form.ssh_key_path || null,
-        branch_filter: form.branch_filter || null,
-        is_active: form.is_active,
+      if (form.webhook_secret_mode === 'none') {
+        payload.webhook_secret = ''
+      } else if (form.webhook_secret_mode === 'custom') {
+        if (form.webhook_secret) {
+          payload.webhook_secret = form.webhook_secret
+        }
+        // else: keep existing custom secret (don't send field)
+      } else if (form.webhook_secret_mode === 'generic') {
+        payload.webhook_secret = null
       }
-      if (form.webhook_secret) {
+    } else {
+      if (form.webhook_secret_mode === 'none') {
+        payload.webhook_secret = ''
+      } else if (form.webhook_secret_mode === 'custom' && form.webhook_secret) {
         payload.webhook_secret = form.webhook_secret
       }
+      // 'generic' → not sent, backend defaults to None
+    }
+
+    if (isEditing.value) {
       await updateRepository(form.id, payload)
       ElMessage.success('仓库配置已更新')
     } else {
-      const res = await createRepository({
-        name: form.name,
-        alias: form.alias || null,
-        clone_url: form.clone_url || null,
-        webhook_secret: form.webhook_secret || null,
-        ssh_key_path: form.ssh_key_path || null,
-        branch_filter: form.branch_filter || null,
-        is_active: form.is_active,
-      }, { params: { scan: scanAfterCreate.value } })
+      payload.name = form.name
+      const res = await createRepository(payload, { params: { scan: scanAfterCreate.value } })
       const data = res.data
       let msg = '仓库已添加'
       if (scanAfterCreate.value && data.task) {
@@ -371,12 +404,26 @@ onUnmounted(() => {
           />
         </el-form-item>
         <el-form-item label="Webhook Secret">
-          <el-input
-            v-model="form.webhook_secret"
-            type="password"
-            show-password
-            :placeholder="isEditing ? '留空则不修改' : '可选'"
-          />
+          <div style="width: 100%;">
+            <el-radio-group v-model="form.webhook_secret_mode" style="margin-bottom: 8px;">
+              <el-radio value="generic">通用密钥</el-radio>
+              <el-radio value="none">无密钥</el-radio>
+              <el-radio value="custom">自定义密钥</el-radio>
+            </el-radio-group>
+            <el-input
+              v-if="form.webhook_secret_mode === 'custom'"
+              v-model="form.webhook_secret"
+              type="password"
+              show-password
+              :placeholder="isEditing ? '留空则不修改' : '输入自定义密钥'"
+            />
+            <div v-else style="color: var(--color-text-muted); font-size: 12px;">
+              <template v-if="form.webhook_secret_mode === 'generic'">
+                使用全局配置中的通用 Webhook Secret
+              </template>
+              <template v-else>跳过签名校验（不推荐）</template>
+            </div>
+          </div>
         </el-form-item>
         <el-form-item label="SSH Key 路径">
           <el-input

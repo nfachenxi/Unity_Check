@@ -79,4 +79,13 @@ export function resetSystem() {
   return api.post('/system/reset')
 }
 
+// ---- Global Settings ----
+export function getSystemSettings() {
+  return api.get('/system/settings')
+}
+
+export function updateSystemSettings(data) {
+  return api.put('/system/settings', data)
+}
+
 export default api

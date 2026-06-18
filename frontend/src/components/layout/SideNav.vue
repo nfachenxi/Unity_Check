@@ -16,6 +16,7 @@ const navItems = [
   { path: '/events', title: '事件列表', icon: 'List' },
   { path: '/repositories', title: '仓库管理', icon: 'FolderOpened' },
   { path: '/stats', title: '统计中心', icon: 'DataAnalysis' },
+  { path: '/settings', title: '全局配置', icon: 'Setting' },
 ]
 </script>
 

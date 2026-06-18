@@ -104,7 +104,7 @@ def _process_full_scan(task_id: int, repo_id: int) -> None:
 
         # --- Clone / fetch bare repo ---
         try:
-            bare_path = ensure_bare_repo(repo.clone_url, ssh_key_path=repo.ssh_key_path)
+            bare_path = ensure_bare_repo(repo.clone_url, ssh_key_path=repo.ssh_key_path or settings.git_ssh_key_path)
         except GitServiceError:
             _detect = resolve_bare_path(repo.clone_url) if repo.clone_url else None
             if _detect and os.path.isdir(_detect):
@@ -201,7 +201,7 @@ def _process_incremental_scan(task_id: int, event_id: int | None, repo_id: int |
         clone_url = extract_clone_url_from_payload(event.payload)
         try:
             if clone_url and event.after_sha:
-                bare_path = ensure_bare_repo(clone_url, ssh_key_path=repo.ssh_key_path if repo else None)
+                bare_path = ensure_bare_repo(clone_url, ssh_key_path=(repo.ssh_key_path or settings.git_ssh_key_path) if repo else settings.git_ssh_key_path)
                 event.clone_path = bare_path
 
                 _update_task_progress(db, pk, "正在解析代码差异...")

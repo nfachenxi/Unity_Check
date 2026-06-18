@@ -73,3 +73,6 @@ def run_migrations() -> None:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE repositories ADD COLUMN alias VARCHAR(255)"))
             conn.commit()
+
+    # --- migration: ensure system_settings table ---
+    Base.metadata.create_all(bind=engine)
