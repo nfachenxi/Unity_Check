@@ -45,6 +45,22 @@ def resolve_bare_path(clone_url: str) -> str:
     return os.path.join(clone_base, f"{repo_dir}.git")
 
 
+def _apply_mirror(clone_url: str) -> str:
+    """If ``settings.github_mirror_url`` is set, rewrite the clone URL.
+
+    Only applies to ``https://github.com/`` URLs — SSH and other hosts
+    are returned unchanged.
+    """
+    mirror = settings.github_mirror_url
+    if not mirror or not clone_url:
+        return clone_url
+    if not clone_url.startswith("https://github.com/"):
+        return clone_url
+    mirrored = mirror.rstrip("/") + "/" + clone_url
+    logger.debug("Git mirror applied: %s -> %s", clone_url, mirrored)
+    return mirrored
+
+
 def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     """Clone a bare repo or fetch if it already exists.
 
@@ -59,6 +75,9 @@ def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
     clone_base = os.path.abspath(settings.git_clone_base_dir)
     repo_dir = _repo_name_from_url(clone_url)
     bare_path = os.path.join(clone_base, f"{repo_dir}.git")
+
+    # Apply GitHub mirror if configured (path uses original URL, git ops use effective)
+    effective_url = _apply_mirror(clone_url)
 
     # Set up SSH command if key path provided (restore in finally block)
     _prev_ssh = os.environ.get("GIT_SSH_COMMAND")
@@ -77,8 +96,13 @@ def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
                 except Exception:
                     has_refspec = False
                 if not has_refspec:
-                    repo.git.remote("set-url", "origin", clone_url)
+                    repo.git.remote("set-url", "origin", effective_url)
                     repo.git.config("remote.origin.fetch", "+refs/heads/*:refs/heads/*")
+                else:
+                    # Ensure remote URL respects mirror config
+                    current_url = repo.git.remote("get-url", "origin")
+                    if current_url != effective_url:
+                        repo.git.remote("set-url", "origin", effective_url)
                 origin = repo.remote("origin")
                 origin.fetch()
             except Exception as exc:
@@ -86,10 +110,10 @@ def ensure_bare_repo(clone_url: str, ssh_key_path: str | None = None) -> str:
                     f"Failed to fetch bare repo at {bare_path}: {exc}"
                 ) from exc
         else:
-            logger.info("Cloning bare repo: %s -> %s", clone_url, bare_path)
+            logger.info("Cloning bare repo: %s -> %s", effective_url, bare_path)
             try:
                 git.Repo.clone_from(
-                    clone_url,
+                    effective_url,
                     bare_path,
                     bare=True,
                 )

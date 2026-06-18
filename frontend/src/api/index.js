@@ -65,4 +65,13 @@ export function scanRepository(id) {
   return api.post(`/repositories/${id}/scan`, null, { timeout: 120000 })
 }
 
+// ---- Tasks ----
+export function getTasks(params) {
+  return api.get('/tasks', { params })
+}
+
+export function getTask(id) {
+  return api.get(`/tasks/${id}`)
+}
+
 export default api

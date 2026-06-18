@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { reactive, ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getRepositories,
@@ -7,13 +7,17 @@ import {
   updateRepository,
   deleteRepository,
   scanRepository,
+  getTasks,
+  getTask,
 } from '../api/index.js'
 
 const loading = ref(false)
-const scanningId = ref(null)
 const repos = ref([])
+const repoTasks = ref({})  // repo_id -> {taskId, status, progress_detail}
+const _pollers = {}        // repo_id -> interval handle (non-reactive)
 
 // Dialog state
+const submitting = ref(false)
 const dialogVisible = ref(false)
 const dialogTitle = ref('')
 const isEditing = ref(false)
@@ -38,13 +42,66 @@ const emptyForm = () => ({
   is_active: true,
 })
 
+// ---- Task polling helpers ----
+
+function _stopPoll(repoId) {
+  if (_pollers[repoId]) {
+    clearInterval(_pollers[repoId])
+    delete _pollers[repoId]
+  }
+}
+
+function _startPoll(taskId, repoId) {
+  _stopPoll(repoId)
+  _pollers[repoId] = setInterval(async () => {
+    try {
+      const res = await getTask(taskId)
+      const t = res.data
+      repoTasks.value = { ...repoTasks.value, [repoId]: { taskId: t.id, status: t.status, progress_detail: t.progress_detail } }
+      if (['completed', 'failed'].includes(t.status)) {
+        _stopPoll(repoId)
+        fetchRepos()
+      }
+    } catch {
+      _stopPoll(repoId)
+    }
+  }, 3000)
+}
+
+// ---- Data loading ----
+
 async function fetchRepos() {
   loading.value = true
   try {
-    const res = await getRepositories()
-    repos.value = res.data
+    const [reposRes, tasksRes] = await Promise.all([
+      getRepositories(),
+      getTasks({ limit: 100 }),
+    ])
+    repos.value = reposRes.data
+
+    // Merge task statuses into map (only pending/processing overwrite stale states)
+    const fresh = {}
+    for (const t of tasksRes.data) {
+      if (t.repository_id && !fresh[t.repository_id]) {
+        fresh[t.repository_id] = { taskId: t.id, status: t.status, progress_detail: t.progress_detail }
+      }
+    }
+    const current = { ...repoTasks.value }
+    for (const [rid, info] of Object.entries(fresh)) {
+      if (!current[rid] || ['pending', 'processing'].includes(info.status)) {
+        current[rid] = info
+      }
+    }
+    repoTasks.value = current
+
+    // Start pollers for any in-flight tasks
+    for (const [rid, info] of Object.entries(fresh)) {
+      if (info.status === 'processing' || info.status === 'pending') {
+        _startPoll(info.taskId, Number(rid))
+      }
+    }
   } catch (e) {
-    ElMessage.error('加载仓库列表失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('加载失败: ' + (e.response?.data?.detail || e.message))
   } finally {
     loading.value = false
   }
@@ -72,30 +129,30 @@ function openEditDialog(repo) {
 }
 
 async function handleScan(repo) {
-  scanningId.value = repo.id
   try {
     const res = await scanRepository(repo.id)
     const data = res.data
-    if (data.status === 'success') {
-      const score = data.overall_score != null ? `${data.overall_score}/100` : 'N/A'
-      const risk = data.risk_level || 'unknown'
-      ElMessage.success({
-        message: `扫描完成 — 评分: ${score}, 风险: ${risk}, 评估文件数: ${data.files_evaluated}`,
-        duration: 6000,
-      })
-    } else if (data.status === 'failed') {
-      ElMessage.error('扫描失败: ' + (data.error || '未知错误'))
+    if (data.status === 'accepted') {
+      ElMessage.success('扫描任务已加入队列')
+      repoTasks.value = {
+        ...repoTasks.value,
+        [repo.id]: { taskId: data.task_id, status: 'pending', progress_detail: '排队中' },
+      }
+      _startPoll(data.task_id, repo.id)
+    }
+  } catch (e) {
+    const detail = e.response?.data?.detail || e.message
+    if (e.response?.status === 409) {
+      ElMessage.warning(detail)
+    } else {
+      ElMessage.error('扫描请求失败: ' + detail)
     }
     await fetchRepos()
-  } catch (e) {
-    ElMessage.error('扫描请求失败: ' + (e.response?.data?.detail || e.message))
-    await fetchRepos()
-  } finally {
-    scanningId.value = null
   }
 }
 
 async function handleSubmit() {
+  submitting.value = true
   try {
     if (isEditing.value) {
       const payload = {
@@ -118,15 +175,24 @@ async function handleSubmit() {
         branch_filter: form.branch_filter || null,
         is_active: form.is_active,
       }, { params: { scan: scanAfterCreate.value } })
-      const msg = scanAfterCreate.value && res.data?.scan
-        ? `仓库已添加，扫描${res.data.scan.status === 'success' ? '完成' : '失败'}`
-        : '仓库已添加'
+      const data = res.data
+      let msg = '仓库已添加'
+      if (scanAfterCreate.value && data.task) {
+        msg = '仓库已添加，扫描任务已加入队列'
+        repoTasks.value = {
+          ...repoTasks.value,
+          [data.id]: { taskId: data.task.id, status: 'pending', progress_detail: '排队中' },
+        }
+        _startPoll(data.task.id, data.id)
+      }
       ElMessage.success(msg)
     }
     dialogVisible.value = false
     await fetchRepos()
   } catch (e) {
     ElMessage.error('操作失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    submitting.value = false
   }
 }
 
@@ -160,7 +226,27 @@ function statusTagType(status) {
   return map[status] || 'info'
 }
 
+function taskTagInfo(repoId) {
+  const t = repoTasks.value[repoId]
+  if (!t) return { show: false }
+  switch (t.status) {
+    case 'pending':  return { show: true, type: 'warning', label: '排队中' }
+    case 'processing': return { show: true, type: 'primary', label: '扫描中' }
+    case 'completed': return { show: true, type: 'success', label: '完成' }
+    case 'failed':   return { show: true, type: 'danger', label: '失败' }
+    default:         return { show: false }
+  }
+}
+
+function isTaskRunning(repoId) {
+  const t = repoTasks.value[repoId]
+  return t && ['pending', 'processing'].includes(t.status)
+}
+
 onMounted(fetchRepos)
+onUnmounted(() => {
+  Object.values(_pollers).forEach(clearInterval)
+})
 </script>
 
 <template>
@@ -191,6 +277,16 @@ onMounted(fetchRepos)
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="扫描状态" width="100" align="center">
+          <template #default="{ row }">
+            <template v-if="taskTagInfo(row.id).show">
+              <el-tag :type="taskTagInfo(row.id).type" size="small" effect="dark">
+                {{ taskTagInfo(row.id).label }}
+              </el-tag>
+            </template>
+            <span v-else style="color: var(--color-text-muted); font-size: 12px;">-</span>
+          </template>
+        </el-table-column>
         <el-table-column label="活跃" width="80" align="center">
           <template #default="{ row }">
             <el-tag :type="row.is_active ? 'success' : 'info'" size="small" effect="plain">
@@ -219,11 +315,10 @@ onMounted(fetchRepos)
               size="small"
               text
               type="primary"
-              :loading="scanningId === row.id"
-              :disabled="scanningId === row.id || !row.clone_url"
+              :disabled="!row.clone_url || isTaskRunning(row.id)"
               @click="handleScan(row)"
             >
-              {{ scanningId === row.id ? '扫描中' : '扫描' }}
+              {{ isTaskRunning(row.id) ? '扫描中' : '扫描' }}
             </el-button>
             <el-button size="small" text type="primary" @click="openEditDialog(row)">
               编辑
@@ -289,7 +384,7 @@ onMounted(fetchRepos)
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="handleSubmit">保存</el-button>
+        <el-button :loading="submitting" :disabled="submitting" type="primary" @click="handleSubmit">保存</el-button>
       </template>
     </el-dialog>
   </div>

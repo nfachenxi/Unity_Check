@@ -110,3 +110,26 @@ class EvaluationRound(Base):
 
     # relationships
     event: Mapped["GithubEvent"] = relationship(back_populates="evaluation_rounds")
+
+
+class Task(Base):
+    """Background task queue: scan/evaluation jobs processed by the worker thread."""
+
+    __tablename__ = "tasks"
+    __table_args__ = (Index("idx_tasks_status_created", "status", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    type: Mapped[str] = mapped_column(String(32))  # full_scan, incremental_scan
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending", index=True
+    )  # pending, processing, completed, failed
+    progress_detail: Mapped[str | None] = mapped_column(String(256))
+    repository_id: Mapped[int | None] = mapped_column(index=True)
+    event_id: Mapped[int | None] = mapped_column(index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )

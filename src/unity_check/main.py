@@ -12,18 +12,8 @@ from sqlalchemy.orm import Session
 from unity_check import repository_service, webhook_service
 from unity_check.config import get_settings
 from unity_check.db import Base, engine, get_db, run_migrations
-from unity_check.git_service import (
-    GitServiceError,
-    ensure_bare_repo,
-    extract_clone_url_from_payload,
-    extract_sha_from_payload,
-    generate_full_cs_diff,
-    get_default_branch_head,
-    get_diff,
-    resolve_bare_path,
-)
-from unity_check.models import EvaluationRound, GithubEvent, Repository
-from unity_check.orchestrator import run_evaluation_pipeline
+from unity_check.git_service import extract_sha_from_payload
+from unity_check.models import EvaluationRound, GithubEvent, Repository, Task
 
 settings = get_settings()
 
@@ -63,6 +53,14 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     run_migrations()
     logger.info("Database tables are ready.")
+
+    # Start background task worker
+    import threading
+    from unity_check.task_worker import run_worker
+    worker_thread = threading.Thread(target=run_worker, daemon=True, name="task-worker")
+    worker_thread.start()
+    logger.info("Background task worker started")
+
     yield
 
 
@@ -152,45 +150,22 @@ async def receive_github_webhook(
         before_sha=before_sha,
         after_sha=after_sha,
         payload=payload,
-        status="running",
+        status="queued",
     )
     db.add(event)
     db.flush()
 
-    # --- Synchronous processing ---
-    try:
-        clone_url = extract_clone_url_from_payload(payload)
-        if clone_url and after_sha:
-            bare_path = ensure_bare_repo(
-                clone_url,
-                ssh_key_path=repo_obj.ssh_key_path if repo_obj else None,
-            )
-            event.clone_path = bare_path
-            diff = get_diff(bare_path, before_sha or "", after_sha)
-            event.diff_content = diff
-            event.diff_size = len(diff.encode("utf-8")) if diff else 0
-
-        run_evaluation_pipeline(event, db)
-        if repo_obj:
-            repository_service.mark_repository_synced(db, repo_obj.id)
-        db.commit()
-        return {"status": "success", "event_id": str(event.id)}
-    except GitServiceError as exc:
-        logger.exception("Git workflow failed for event %s", event.id)
-        event.status = "failed"
-        event.error_message = str(exc)
-        if repo_obj:
-            repository_service.mark_repository_error(db, repo_obj.id, str(exc))
-        db.commit()
-        return {"status": "failed", "event_id": str(event.id), "error": str(exc)}
-    except Exception as exc:
-        logger.exception("Sync processing failed for event %s", event.id)
-        event.status = "failed"
-        event.error_message = str(exc)
-        if repo_obj:
-            repository_service.mark_repository_error(db, repo_obj.id, str(exc))
-        db.commit()
-        return {"status": "failed", "event_id": str(event.id), "error": str(exc)}
+    # --- Queue background task ---
+    task = Task(
+        type="incremental_scan",
+        repository_id=repo_obj.id if repo_obj else None,
+        event_id=event.id,
+        progress_detail="排队中",
+    )
+    db.add(task)
+    db.commit()
+    logger.info("Queued incremental_scan task %d for event %d", task.id, event.id)
+    return {"status": "accepted", "event_id": event.id, "task_id": task.id}
 
 
 # ---------------------------------------------------------------------------
@@ -528,65 +503,20 @@ def create_repository_api(
         )
         result = _repo_to_dict(repo)
 
-        # Optional: trigger full scan after registration
+        # Optional: queue full scan after registration
         if scan and repo.clone_url:
-            try:
-                try:
-                    bare_path = ensure_bare_repo(
-                        repo.clone_url,
-                        ssh_key_path=repo.ssh_key_path,
-                    )
-                except GitServiceError:
-                    _detect = resolve_bare_path(repo.clone_url)
-                    if _detect and os.path.isdir(_detect):
-                        logger.warning(
-                            "Initial scan fetch failed for %s, using existing bare repo",
-                            repo.name,
-                        )
-                        bare_path = _detect
-                    else:
-                        raise
-                sha = get_default_branch_head(bare_path)
-                if sha:
-                    diff = generate_full_cs_diff(bare_path, sha)
-                    event = GithubEvent(
-                        delivery_id=None,
-                        event_type="initial_scan",
-                        action="scan",
-                        repository=repo.name,
-                        repository_id=repo.id,
-                        after_sha=sha,
-                        clone_path=bare_path,
-                        diff_content=diff,
-                        diff_size=len(diff.encode("utf-8")) if diff else 0,
-                        payload={
-                            "repository": {"full_name": repo.name},
-                            "scan_type": "full",
-                            "commit_sha": sha,
-                        },
-                        status="running",
-                    )
-                    db.add(event)
-                    db.flush()
-
-                    scan_result = run_evaluation_pipeline(event, db)
-                    repository_service.mark_repository_synced(db, repo.id)
-                    result["scan"] = {
-                        "status": "success",
-                        "event_id": event.id,
-                        **scan_result,
-                    }
-                else:
-                    result["scan"] = {
-                        "status": "skipped",
-                        "reason": "Could not resolve default branch HEAD — repository may be empty",
-                    }
-            except Exception as exc:
-                logger.warning("Initial scan failed for new repo %s: %s", repo.name, exc)
-                result["scan"] = {
-                    "status": "failed",
-                    "error": str(exc),
-                }
+            task = Task(
+                type="full_scan",
+                repository_id=repo.id,
+                progress_detail="排队中",
+            )
+            db.add(task)
+            db.flush()
+            result["task"] = {
+                "id": task.id,
+                "status": "pending",
+                "progress_detail": "排队中",
+            }
 
         db.commit()
         return result
@@ -651,108 +581,37 @@ def scan_repository(
             detail="Repository has no clone_url configured — set one via PUT /api/repositories/{id}",
         )
 
-    # Track if we are in a fallback mode (fetch failed, using existing data)
-    fallback = False
-
-    # ---- Clone / fetch bare repo --------------------------------------------
-    try:
-        bare_path = ensure_bare_repo(
-            repo.clone_url,
-            ssh_key_path=repo.ssh_key_path,
-        )
-    except GitServiceError:
-        # If fetch failed but the bare repo directory exists, use existing data.
-        _detect_bare_path = resolve_bare_path(repo.clone_url)
-        if _detect_bare_path and os.path.isdir(_detect_bare_path):
-            logger.warning(
-                "Fetch failed for %s but bare repo exists at %s — "
-                "falling back to existing data",
-                repo.name, _detect_bare_path,
-            )
-            bare_path = _detect_bare_path
-            fallback = True
-        else:
-            logger.exception("Failed to clone/fetch repo %s (id=%s)", repo.name, repo_id)
-            repository_service.mark_repository_error(
-                db, repo.id,
-                "无法连接远程仓库，请检查 clone_url 和 SSH 密钥配置",
-            )
-            db.commit()
-            raise HTTPException(
-                status_code=502,
-                detail="无法连接到远程仓库，请检查 clone_url 和 SSH 密钥配置是否正确。",
-            )
-
-    # ---- Resolve default branch HEAD ----------------------------------------
-    sha = get_default_branch_head(bare_path)
-    if not sha:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not resolve a default branch HEAD from the bare repository. "
-                   "Ensure the repository has at least one commit.",
-        )
-
-    # ---- Generate full .cs diff ---------------------------------------------
-    diff = generate_full_cs_diff(bare_path, sha)
-
-    # ---- Create an initial_scan event ---------------------------------------
-    event = GithubEvent(
-        delivery_id=None,
-        event_type="initial_scan",
-        action="scan",
-        repository=repo.name,
-        repository_id=repo.id,
-        after_sha=sha,
-        before_sha=None,
-        clone_path=bare_path,
-        diff_content=diff,
-        diff_size=len(diff.encode("utf-8")) if diff else 0,
-        payload={
-            "repository": {"full_name": repo.name},
-            "scan_type": "full",
-            "commit_sha": sha,
-            "fallback": fallback,
-        },
-        status="running",
+    # Guard: reject if a task for this repo is already pending or processing
+    existing = db.scalar(
+        select(Task)
+        .where(Task.repository_id == repo_id, Task.status.in_(["pending", "processing"]))
+        .limit(1)
     )
-    db.add(event)
-    db.flush()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该仓库已有扫描任务正在进行中（任务 #{existing.id}，状态：{existing.status}）",
+        )
 
-    # ---- Run evaluation pipeline --------------------------------------------
-    try:
-        result = run_evaluation_pipeline(event, db)
-        repository_service.mark_repository_synced(db, repo.id)
-        db.commit()
-        return {
-            "status": "success",
-            "event_id": event.id,
-            "commit_sha": sha,
-            "fallback": fallback,
-            **result,
-        }
-    except Exception as exc:
-        logger.exception("Full scan failed for repo %s (id=%s)", repo.name, repo_id)
-        event.status = "failed"
-        event.error_message = str(exc)
-        _mark_repository_error_safe(db, repo.id, "扫描评估失败: " + str(exc))
-        db.commit()
-        return {
-            "status": "failed",
-            "event_id": event.id,
-            "commit_sha": sha,
-            "fallback": fallback,
-            "error": str(exc),
-        }
-
-
-def _mark_repository_error_safe(
-    db: Session, repo_id: int, message: str,
-) -> None:
-    """Set repository error status, swallowing any session exceptions."""
-    try:
-        repository_service.mark_repository_error(db, repo_id, message)
-    except Exception:
-        logger.warning("Failed to mark repo %s error (session may be invalid)", repo_id)
+    # Queue background scan task
+    task = Task(
+        type="full_scan",
+        repository_id=repo.id,
+        progress_detail="排队中",
+    )
+    db.add(task)
+    db.commit()
+    logger.info("Queued full_scan task %d for repo %s", task.id, repo.name)
+    return {
+        "status": "accepted",
+        "task_id": task.id,
+        "task": {
+            "id": task.id,
+            "type": "full_scan",
+            "status": "pending",
+            "progress_detail": "排队中",
+        },
+    }
 
 
 @app.delete("/api/repositories/{repo_id}")
@@ -763,6 +622,60 @@ def delete_repository_api(repo_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail=f"Repository {repo_id} not found")
     db.commit()
     return {"status": "deleted", "id": repo_id}
+
+
+# ---------------------------------------------------------------------------
+# Task management
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/tasks")
+def list_tasks(
+    repository_id: int | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """List background tasks, most recent first."""
+    base = select(Task)
+    if repository_id:
+        base = base.where(Task.repository_id == repository_id)
+    if status:
+        base = base.where(Task.status == status)
+    base = base.order_by(Task.created_at.desc()).limit(min(limit, 100))
+    return [
+        {
+            "id": t.id,
+            "type": t.type,
+            "status": t.status,
+            "progress_detail": t.progress_detail,
+            "repository_id": t.repository_id,
+            "event_id": t.event_id,
+            "error_message": t.error_message,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        }
+        for t in db.scalars(base).all()
+    ]
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: int, db: Session = Depends(get_db)) -> dict:
+    """Get a single task's status and progress."""
+    task = db.scalar(select(Task).where(Task.id == task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return {
+        "id": task.id,
+        "type": task.type,
+        "status": task.status,
+        "progress_detail": task.progress_detail,
+        "repository_id": task.repository_id,
+        "event_id": task.event_id,
+        "error_message": task.error_message,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
 
 
 # ---------------------------------------------------------------------------
