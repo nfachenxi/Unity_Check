@@ -1,14 +1,59 @@
 <script setup>
-defineProps({
+import { ref, computed } from 'vue'
+import RiskTag from '../common/RiskTag.vue'
+
+const props = defineProps({
   evaluations: { type: Array, default: () => [] },
   dimensionName: { type: String, default: '' },
   dimensionScore: { type: [Number, String], default: '-' },
+  eventId: { type: [Number, String], default: null },
 })
 
-function getSeverityType(severity) {
-  return severity === 'critical' || severity === 'high' ? 'danger' : severity === 'medium' ? 'warning' : 'info'
+// ---- Collapse state (localStorage-backed) ----
+const storageKey = computed(() => `file-collapse-${props.eventId || 'default'}`)
+
+function loadCollapsed() {
+  try {
+    const raw = localStorage.getItem(storageKey.value)
+    return raw ? new Set(JSON.parse(raw)) : new Set()
+  } catch { return new Set() }
 }
 
+const collapsedFiles = ref(loadCollapsed())
+
+function toggleCollapse(filePath) {
+  const s = new Set(collapsedFiles.value)
+  if (s.has(filePath)) s.delete(filePath)
+  else s.add(filePath)
+  collapsedFiles.value = s
+  try {
+    localStorage.setItem(storageKey.value, JSON.stringify([...s]))
+  } catch { /* localStorage full or unavailable */ }
+}
+
+function isCollapsed(filePath) {
+  return collapsedFiles.value.has(filePath)
+}
+
+// ---- Sorting: by highest severity desc, then score asc ----
+const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
+
+function maxSeverityRank(evalRound) {
+  const findings = evalRound.output_data?.findings
+  if (!findings?.length) return 0
+  return Math.max(...findings.map(f => SEVERITY_RANK[f.severity?.toLowerCase()] || 0))
+}
+
+const sortedEvaluations = computed(() => {
+  return [...props.evaluations].sort((a, b) => {
+    const rankA = maxSeverityRank(a)
+    const rankB = maxSeverityRank(b)
+    if (rankB !== rankA) return rankB - rankA
+    return (a.score ?? 0) - (b.score ?? 0)
+  })
+})
+
+// ---- Severity color (for card left border) ----
 function getSeverityColor(severity) {
   if (severity === 'critical' || severity === 'high') return 'var(--color-critical)'
   if (severity === 'medium') return 'var(--color-warning)'
@@ -32,10 +77,11 @@ function getSeverityColor(severity) {
     </div>
 
     <!-- File evaluation blocks -->
-    <div v-for="r in evaluations" :key="r.id" class="file-eval-card">
-      <!-- File header -->
-      <div class="file-eval-header">
+    <div v-for="r in sortedEvaluations" :key="r.id" class="file-eval-card">
+      <!-- File header — clickable toggle -->
+      <div class="file-eval-header" @click="toggleCollapse(r.file_path)" role="button" tabindex="0" @keydown.enter="toggleCollapse(r.file_path)">
         <div class="file-eval-header-left">
+          <span class="collapse-arrow" :class="{ collapsed: isCollapsed(r.file_path) }">▼</span>
           <span class="file-icon">📄</span>
           <span class="file-path-text">{{ r.file_path }}</span>
         </div>
@@ -44,45 +90,42 @@ function getSeverityColor(severity) {
         </div>
       </div>
 
-      <!-- Summary -->
-      <p v-if="r.output_data?.summary" class="file-eval-summary">{{ r.output_data.summary }}</p>
+      <!-- Collapsible content -->
+      <div v-show="!isCollapsed(r.file_path)">
+        <!-- Summary -->
+        <p v-if="r.output_data?.summary" class="file-eval-summary">{{ r.output_data.summary }}</p>
 
-      <!-- Error state -->
-      <div v-if="r.status === 'failed'" class="error-block">
-        <el-alert :title="r.error_message" type="error" show-icon :closable="false" />
-      </div>
-
-      <!-- Findings list -->
-      <div v-else-if="r.output_data?.findings?.length" class="findings-list">
-        <div
-          v-for="(f, i) in r.output_data.findings"
-          :key="i"
-          class="finding-card"
-          :style="{ borderLeftColor: getSeverityColor(f.severity) }"
-        >
-          <div class="finding-header">
-            <el-tag
-              :type="getSeverityType(f.severity)"
-              size="small"
-              effect="dark"
-            >
-              {{ f.severity || '?' }}
-            </el-tag>
-            <span class="finding-title-text">{{ f.title }}</span>
-            <el-tag size="small" type="info" effect="plain">{{ f.category }}</el-tag>
-          </div>
-          <div class="finding-desc">{{ f.description }}</div>
-          <div v-if="f.suggestion" class="finding-suggestion">
-            <span class="suggestion-icon">💡</span>
-            {{ f.suggestion }}
-          </div>
-          <div v-if="f.line_hint" class="finding-location">📍 {{ f.line_hint }}</div>
+        <!-- Error state -->
+        <div v-if="r.status === 'failed'" class="error-block">
+          <el-alert :title="r.error_message" type="error" show-icon :closable="false" />
         </div>
-      </div>
 
-      <!-- Empty state -->
-      <div v-else class="findings-empty">
-        <el-empty description="此文件未发现问题" :image-size="60" />
+        <!-- Findings list -->
+        <div v-else-if="r.output_data?.findings?.length" class="findings-list">
+          <div
+            v-for="(f, i) in r.output_data.findings"
+            :key="i"
+            class="finding-card"
+            :style="{ borderLeftColor: getSeverityColor(f.severity) }"
+          >
+            <div class="finding-header">
+              <RiskTag :level="f.severity" size="small" />
+              <span class="finding-title-text">{{ f.title }}</span>
+              <el-tag size="small" type="info" effect="plain">{{ f.category }}</el-tag>
+            </div>
+            <div class="finding-desc">{{ f.description }}</div>
+            <div v-if="f.suggestion" class="finding-suggestion">
+              <span class="suggestion-icon">💡</span>
+              {{ f.suggestion }}
+            </div>
+            <div v-if="f.line_hint" class="finding-location">📍 {{ f.line_hint }}</div>
+          </div>
+        </div>
+
+        <!-- Empty state -->
+        <div v-else class="findings-empty">
+          <el-empty description="此文件未发现问题" :image-size="60" />
+        </div>
       </div>
     </div>
 
@@ -144,6 +187,13 @@ function getSeverityColor(severity) {
   padding: 12px 16px;
   background: var(--color-bg-elevated);
   border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+  user-select: none;
+  transition: background 150ms ease;
+}
+
+.file-eval-header:hover {
+  background: var(--color-bg-card);
 }
 
 .file-eval-header-left {
@@ -151,6 +201,20 @@ function getSeverityColor(severity) {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex: 1;
+}
+
+.collapse-arrow {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  transition: transform 200ms ease;
+  flex-shrink: 0;
+  width: 12px;
+  text-align: center;
+}
+
+.collapse-arrow.collapsed {
+  transform: rotate(-90deg);
 }
 
 .file-icon {

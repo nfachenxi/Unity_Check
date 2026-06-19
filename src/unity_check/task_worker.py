@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections.abc
 import logging
 import os
 import time
@@ -69,6 +70,34 @@ def _update_task_progress(db, task_pk: int, progress: str) -> None:
     """Update a task's progress_detail and commit."""
     db.execute(update(Task).where(Task.id == task_pk).values(progress_detail=progress))
     db.commit()
+
+
+def _update_task_progress_value(db, task_pk: int, progress: str, value: int) -> None:
+    """Update a task's progress_detail, progress_value and commit."""
+    db.execute(
+        update(Task)
+        .where(Task.id == task_pk)
+        .values(progress_detail=progress, progress_value=value)
+    )
+    db.commit()
+
+
+def _make_progress_callback(task_pk: int) -> collections.abc.Callable[[int, int], None]:
+    """Create a progress callback that updates the Task record from the orchestrator."""
+    def cb(current: int, total: int) -> None:
+        pct = int(current / total * 100) if total else 0
+        db2 = SessionLocal()
+        try:
+            _update_task_progress_value(
+                db2, task_pk,
+                progress=f"正在评估 {current}/{total} 个文件",
+                value=pct,
+            )
+        except Exception:
+            db2.rollback()
+        finally:
+            db2.close()
+    return cb
 
 
 def _fail_task(db, task_pk: int, message: str) -> None:
@@ -151,7 +180,8 @@ def _process_full_scan(task_id: int, repo_id: int) -> None:
 
         # --- Run evaluation ---
         _update_task_progress(db, pk, "正在评估代码...")
-        run_evaluation_pipeline(event, db)
+        progress_cb = _make_progress_callback(pk)
+        run_evaluation_pipeline(event, db, progress_callback=progress_cb)
 
         # --- Success ---
         repository_service.mark_repository_synced(db, repo.id)
@@ -230,7 +260,8 @@ def _process_incremental_scan(task_id: int, event_id: int | None, repo_id: int |
         db.flush()
 
         _update_task_progress(db, pk, "正在评估代码...")
-        run_evaluation_pipeline(event, db)
+        progress_cb = _make_progress_callback(pk)
+        run_evaluation_pipeline(event, db, progress_callback=progress_cb)
 
         # --- Success ---
         if repo:

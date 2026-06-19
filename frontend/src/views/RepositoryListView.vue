@@ -79,7 +79,7 @@ function _startPoll(taskId, repoId) {
     try {
       const res = await getTask(taskId)
       const t = res.data
-      repoTasks.value = { ...repoTasks.value, [repoId]: { taskId: t.id, status: t.status, progress_detail: t.progress_detail } }
+      repoTasks.value = { ...repoTasks.value, [repoId]: { taskId: t.id, status: t.status, progress_detail: t.progress_detail, progress_value: t.progress_value } }
       if (['completed', 'failed'].includes(t.status)) {
         _stopPoll(repoId)
         fetchRepos()
@@ -105,7 +105,7 @@ async function fetchRepos() {
     const fresh = {}
     for (const t of tasksRes.data) {
       if (t.repository_id && !fresh[t.repository_id]) {
-        fresh[t.repository_id] = { taskId: t.id, status: t.status, progress_detail: t.progress_detail }
+        fresh[t.repository_id] = { taskId: t.id, status: t.status, progress_detail: t.progress_detail, progress_value: t.progress_value }
       }
     }
     const current = { ...repoTasks.value }
@@ -160,7 +160,7 @@ async function handleScan(repo) {
       ElMessage.success('扫描任务已加入队列')
       repoTasks.value = {
         ...repoTasks.value,
-        [repo.id]: { taskId: data.task_id, status: 'pending', progress_detail: '排队中' },
+        [repo.id]: { taskId: data.task_id, status: 'pending', progress_detail: '排队中', progress_value: null },
       }
       _startPoll(data.task_id, repo.id)
     }
@@ -219,7 +219,7 @@ async function handleSubmit() {
         msg = '仓库已添加，扫描任务已加入队列'
         repoTasks.value = {
           ...repoTasks.value,
-          [data.id]: { taskId: data.task.id, status: 'pending', progress_detail: '排队中' },
+          [data.id]: { taskId: data.task.id, status: 'pending', progress_detail: '排队中', progress_value: null },
         }
         _startPoll(data.task.id, data.id)
       }
@@ -281,6 +281,18 @@ function isTaskRunning(repoId) {
   return t && ['pending', 'processing'].includes(t.status)
 }
 
+function isTaskProcessing(repoId) {
+  return repoTasks.value[repoId]?.status === 'processing'
+}
+
+function taskProgressValue(repoId) {
+  return repoTasks.value[repoId]?.progress_value ?? 0
+}
+
+function taskProgressDetail(repoId) {
+  return repoTasks.value[repoId]?.progress_detail || ''
+}
+
 onMounted(fetchRepos)
 onUnmounted(() => {
   Object.values(_pollers).forEach(clearInterval)
@@ -321,10 +333,21 @@ onUnmounted(() => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="扫描状态" width="100" align="center">
+        <el-table-column label="扫描状态" width="280" align="center">
           <template #default="{ row }">
             <template v-if="taskTagInfo(row.id).show">
-              <el-tag :type="taskTagInfo(row.id).type" size="small" effect="dark">
+              <template v-if="isTaskProcessing(row.id)">
+                <div class="scan-progress-wrap">
+                  <el-progress
+                    :percentage="taskProgressValue(row.id)"
+                    :stroke-width="14"
+                    :text-inside="true"
+                    :status="taskProgressValue(row.id) < 100 ? '' : 'success'"
+                  />
+                  <div class="scan-progress-detail">{{ taskProgressDetail(row.id) }}</div>
+                </div>
+              </template>
+              <el-tag v-else :type="taskTagInfo(row.id).type" size="small" effect="dark">
                 {{ taskTagInfo(row.id).label }}
               </el-tag>
             </template>
@@ -455,5 +478,20 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-/* Scoped styles follow existing frontend patterns */
+.scan-progress-wrap {
+  padding: 4px 0;
+}
+
+.scan-progress-wrap .el-progress {
+  margin-bottom: 2px;
+}
+
+.scan-progress-detail {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
 </style>

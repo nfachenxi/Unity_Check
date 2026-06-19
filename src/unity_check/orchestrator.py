@@ -8,6 +8,7 @@ For each .cs file in the diff:
 
 from __future__ import annotations
 
+import collections.abc
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -28,7 +29,10 @@ DIMENSIONS = ["functionality_best_practices", "security_performance_health"]
 # ---------------------------------------------------------------------------
 
 
-def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
+def run_evaluation_pipeline(
+    event: GithubEvent, db: Session,
+    progress_callback: collections.abc.Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
     """Execute per-file, per-dimension evaluation for *event*.
 
     Side-effects
@@ -123,6 +127,13 @@ def run_evaluation_pipeline(event: GithubEvent, db: Session) -> dict[str, Any]:
                 logger.exception("Dimension %s failed for %s event_id=%s", dim, file_path, event_id)
 
         total_files_evaluated += 1
+
+        # Notify progress after each file (both dimensions completed)
+        if progress_callback:
+            try:
+                progress_callback(file_idx, len(cs_files))
+            except Exception:
+                logger.warning("Progress callback failed for file %d/%d", file_idx, len(cs_files))
 
     # ---- Step 3: Programmatic aggregation -----------------------------------
     _aggregate_and_update_event(event, all_dim_scores, all_dim_summaries, all_findings, cs_files)

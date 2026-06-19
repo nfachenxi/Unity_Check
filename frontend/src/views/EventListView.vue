@@ -3,6 +3,7 @@ import { ref, reactive, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getEvents } from '../api/index.js'
+import RiskTag from '../components/common/RiskTag.vue'
 
 const router = useRouter()
 const loading = ref(false)
@@ -16,10 +17,6 @@ const filters = reactive({
   risk_level: '',
   status: '',
 })
-
-function getRiskType(level) {
-  return level === 'critical' || level === 'high' ? 'danger' : level === 'medium' ? 'warning' : 'success'
-}
 
 function getStatusType(s) {
   return s === 'success' ? 'success' : s === 'failed' ? 'danger' : s === 'running' ? 'warning' : 'info'
@@ -156,9 +153,7 @@ onMounted(fetchEvents)
         </el-table-column>
         <el-table-column prop="final_risk_level" label="风险" width="85" align="center">
           <template #default="{ row }">
-            <el-tag :type="getRiskType(row.final_risk_level)" size="small" effect="dark">
-              {{ row.final_risk_level || '-' }}
-            </el-tag>
+            <RiskTag :level="row.final_risk_level" size="small" />
           </template>
         </el-table-column>
         <el-table-column prop="recommendation" label="建议" width="110">

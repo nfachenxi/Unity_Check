@@ -8,6 +8,7 @@ import { TooltipComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import { getEventDetail, getEventEvaluations } from '../api/index.js'
 import FileEvaluationBlock from '../components/dashboard/FileEvaluationBlock.vue'
+import RiskTag from '../components/common/RiskTag.vue'
 
 use([GaugeChart, TooltipComponent, CanvasRenderer])
 
@@ -132,10 +133,6 @@ function dimGaugeOption(score) {
   }
 }
 
-function getRiskType(level) {
-  return level === 'critical' || level === 'high' ? 'danger' : level === 'medium' ? 'warning' : 'success'
-}
-
 function formatMs(ms) {
   if (!ms) return '-'
   if (ms < 1000) return `${ms}ms`
@@ -156,9 +153,7 @@ onMounted(fetchData)
     <!-- Header -->
     <div class="detail-header">
       <h1 class="page-title" style="margin-bottom: 0;">事件详情</h1>
-      <el-tag v-if="event" :type="getRiskType(event.final_risk_level)" size="large" effect="dark">
-        {{ (event.final_risk_level || 'unknown').toUpperCase() }}
-      </el-tag>
+      <RiskTag v-if="event" :level="event.final_risk_level" size="large" />
     </div>
 
     <!-- Event Meta Card -->
@@ -234,6 +229,7 @@ onMounted(fetchData)
             :evaluations="dimARounds"
             dimension-name="维度A"
             :dimension-score="assessment?.dimension_a_score"
+            :event-id="event?.id"
           />
         </el-tab-pane>
 
@@ -243,6 +239,7 @@ onMounted(fetchData)
             :evaluations="dimBRounds"
             dimension-name="维度B"
             :dimension-score="assessment?.dimension_b_score"
+            :event-id="event?.id"
           />
         </el-tab-pane>
 

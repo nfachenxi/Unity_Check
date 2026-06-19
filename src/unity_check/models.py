@@ -139,6 +139,7 @@ class Task(Base):
         String(20), default="pending", index=True
     )  # pending, processing, completed, failed
     progress_detail: Mapped[str | None] = mapped_column(String(256))
+    progress_value: Mapped[int | None] = mapped_column()  # 0-100 进度百分比
     repository_id: Mapped[int | None] = mapped_column(index=True)
     event_id: Mapped[int | None] = mapped_column(index=True)
     error_message: Mapped[str | None] = mapped_column(Text)

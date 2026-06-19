@@ -1,14 +1,11 @@
 <script setup>
 import { useRouter } from 'vue-router'
+import RiskTag from '../common/RiskTag.vue'
 
 const router = useRouter()
 defineProps({
   events: { type: Array, default: () => [] },
 })
-
-function getRiskType(level) {
-  return level === 'critical' || level === 'high' ? 'danger' : level === 'medium' ? 'warning' : 'success'
-}
 
 function formatTime(date) {
   if (!date) return '-'
@@ -55,9 +52,7 @@ function goDetail(id) {
       </el-table-column>
       <el-table-column prop="final_risk_level" label="风险" width="70" align="center">
         <template #default="{ row }">
-          <el-tag :type="getRiskType(row.final_risk_level)" size="small" effect="dark">
-            {{ row.final_risk_level || '-' }}
-          </el-tag>
+          <RiskTag :level="row.final_risk_level" size="small" />
         </template>
       </el-table-column>
       <el-table-column prop="created_at" label="时间" width="100">

@@ -74,5 +74,13 @@ def run_migrations() -> None:
             conn.execute(text("ALTER TABLE repositories ADD COLUMN alias VARCHAR(255)"))
             conn.commit()
 
+    # --- migration: add progress_value to tasks ---
+    task_cols = {c["name"] for c in inspector.get_columns("tasks")}
+    if "progress_value" not in task_cols:
+        logger.info("Migration: adding progress_value column to tasks")
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN progress_value INTEGER"))
+            conn.commit()
+
     # --- migration: ensure system_settings table ---
     Base.metadata.create_all(bind=engine)
