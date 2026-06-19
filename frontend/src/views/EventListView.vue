@@ -4,8 +4,6 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getEvents } from '../api/index.js'
 
-defineOptions({ name: 'EventListPage' })
-
 const router = useRouter()
 const loading = ref(false)
 const events = ref([])

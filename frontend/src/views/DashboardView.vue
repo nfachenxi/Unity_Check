@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onActivated } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getDashboardSummary, getDashboardTrends, getDashboardIssueDistribution } from '../api/index.js'
@@ -9,17 +9,13 @@ import RiskDonut from '../components/dashboard/RiskDonut.vue'
 import IssueBarChart from '../components/dashboard/IssueBarChart.vue'
 import RecentEventsTable from '../components/dashboard/RecentEventsTable.vue'
 
-defineOptions({ name: 'DashboardPage' })
-
 const router = useRouter()
 const loading = ref(true)
 const summary = ref(null)
 const trends = ref([])
 const distribution = ref(null)
-let _lastFetchTime = 0
 
 async function fetchData() {
-  _lastFetchTime = Date.now()
   try {
     const [s, t, d] = await Promise.all([
       getDashboardSummary({ days: 30 }),
@@ -39,13 +35,6 @@ async function fetchData() {
 function goToEvents() {
   router.push('/events')
 }
-
-// Keep-alive: silently re-fetch if data is stale when page is reactivated
-onActivated(() => {
-  if (Date.now() - _lastFetchTime > 30000) {
-    fetchData()
-  }
-})
 
 onMounted(fetchData)
 </script>

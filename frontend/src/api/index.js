@@ -5,62 +5,6 @@ const api = axios.create({
   timeout: 30000,
 })
 
-// ---- In-memory response cache (TTL-based) ----
-// Reduces duplicate network requests when navigating between pages
-const _cache = new Map()
-const CACHE_TTL = 20_000 // 20 seconds
-
-function _cacheKey(config) {
-  return `${config.url}|${JSON.stringify(config.params || {})}`
-}
-
-// Intercept GET requests: serve from cache when available
-api.interceptors.request.use(config => {
-  if (config.method === 'get') {
-    const key = _cacheKey(config)
-    const hit = _cache.get(key)
-    if (hit && Date.now() < hit.expiresAt) {
-      config._fromCache = true
-      // Return cached response directly via adapter override
-      config.adapter = () => Promise.resolve({
-        data: hit.data,
-        status: 200,
-        statusText: 'OK',
-        headers: {},
-        config,
-      })
-    }
-  }
-  return config
-})
-
-// Intercept responses: cache successful GETs, invalidate cache on writes
-api.interceptors.response.use(response => {
-  // Cache successful real (non-cached) GET responses
-  if (
-    response.config.method === 'get' &&
-    response.status === 200 &&
-    !response.config._fromCache
-  ) {
-    const key = _cacheKey(response.config)
-    _cache.set(key, { data: response.data, expiresAt: Date.now() + CACHE_TTL })
-  }
-
-  // Invalidate dashboard cache and resource cache on write operations
-  if (['post', 'put', 'delete', 'patch'].includes(response.config.method)) {
-    const resource = (response.config.url || '').split('/')[1]
-    for (const k of _cache.keys()) {
-      if (k.startsWith('/dashboard') || k.startsWith(`/${resource || ''}`)) {
-        _cache.delete(k)
-      }
-    }
-  }
-
-  return response
-}, error => {
-  return Promise.reject(error)
-})
-
 // ---- Dashboard (unified endpoint) ----
 export function getDashboardSummary(params) {
   return api.get('/dashboard', { params: { ...params, section: 'summary' } })

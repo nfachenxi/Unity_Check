@@ -8,9 +8,6 @@ const sidebarCollapsed = ref(false)
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
 }
-
-// Component names for keep-alive (defined via defineOptions in each keep-alive view)
-const keepAliveNames = ['DashboardPage', 'EventListPage']
 </script>
 
 <template>
@@ -23,11 +20,9 @@ const keepAliveNames = ['DashboardPage', 'EventListPage']
         <AppHeader />
       </el-header>
       <el-main class="app-main">
-        <router-view v-slot="{ Component, route }">
+        <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
-            <keep-alive :include="keepAliveNames">
-              <component :is="Component" :key="route.name" />
-            </keep-alive>
+            <component :is="Component" />
           </transition>
         </router-view>
       </el-main>
