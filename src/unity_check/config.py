@@ -43,7 +43,19 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
         if isinstance(v, list):
-            return v
+            # Flatten: each element may itself be a comma-separated string
+            # (e.g. when pydantic-settings parses a JSON array where one
+            # element contains multiple comma-delimited URLs)
+            result: list[str] = []
+            for item in v:
+                if isinstance(item, str):
+                    for s in item.split(","):
+                        s = s.strip()
+                        if s:
+                            result.append(s)
+                else:
+                    result.append(item)
+            return result
         return []
 
     @model_validator(mode="after")
