@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,10 +24,10 @@ class Settings(BaseSettings):
 
     generic_webhook_secret: str | None = Field(default=None, alias="GENERIC_WEBHOOK_SECRET")
 
-    # GitHub mirrors (comma-separated in env, e.g. GITHUB_MIRROR_URLS=https://a.com,https://b.com)
-    # Order does not matter — the fastest is auto-selected before each clone.
-    github_mirror_urls: list[str] = Field(default_factory=list, alias="GITHUB_MIRROR_URLS")
-    # Kept for backward compatibility; takes effect only when GITHUB_MIRROR_URLS is not set
+    # Primary GitHub mirror base URL (optional).
+    # Additional mirrors can be added via GITHUB_MIRROR_URL_2, GITHUB_MIRROR_URL_3, etc.
+    # Each is used as a prefix: <mirror_url>/<original_clone_url>
+    # Mirrors are tried in order (primary first), then the original URL as fallback.
     github_mirror_url: str | None = Field(default=None, alias="GITHUB_MIRROR_URL")
 
     task_worker_interval: int = Field(default=2, alias="TASK_WORKER_INTERVAL")
@@ -37,49 +37,27 @@ class Settings(BaseSettings):
 
     frontend_password: str | None = Field(default=None, alias="FRONTEND_PASSWORD")
 
-    @field_validator("github_mirror_urls", mode="before")
-    @classmethod
-    def _parse_mirror_urls(cls, v: object) -> list[str]:
-        import json
+    def get_mirror_urls(self) -> list[str]:
+        """Collect all configured mirror base URLs in order.
 
-        # Step 1: normalize to a single string
-        raw = ""
-        if isinstance(v, str):
-            raw = v
-        elif isinstance(v, list):
-            # Flatten: each element may itself be a comma-separated string
-            # (e.g. when pydantic-settings parses a JSON array where one
-            # element contains multiple comma-delimited URLs)
-            raw = ",".join(str(item) for item in v)
-        else:
-            return []
+        Sources (by priority):
+        1. ``GITHUB_MIRROR_URL`` — primary mirror
+        2. ``GITHUB_MIRROR_URL_2``, ``GITHUB_MIRROR_URL_3``, … — additional mirrors
 
-        raw = raw.strip()
-        if not raw:
-            return []
+        Each URL has its trailing ``/`` stripped for consistent prefix joining.
+        """
+        import os
 
-        # Step 2: detect JSON array format — ["url1","url2","url3"]
-        if raw.startswith("[") and raw.endswith("]"):
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    return [str(u).strip() for u in parsed if str(u).strip()]
-            except json.JSONDecodeError:
-                pass  # fall through to comma-split below
-
-        # Step 3: comma-separated format — url1,url2,url3
-        # Clean any stray quotes/brackets that may survive from malformed input
-        return [
-            s.strip().strip('"').strip("[").strip("]")
-            for s in raw.split(",")
-            if s.strip().strip('"').strip("[").strip("]")
-        ]
-
-    @model_validator(mode="after")
-    def _resolve_mirrors(self) -> "Settings":
-        if not self.github_mirror_urls and self.github_mirror_url:
-            self.github_mirror_urls = [self.github_mirror_url]
-        return self
+        urls: list[str] = []
+        if self.github_mirror_url:
+            urls.append(self.github_mirror_url.rstrip("/"))
+        for idx in range(2, 10):  # _2 through _9
+            val = os.environ.get(f"GITHUB_MIRROR_URL_{idx}")
+            if val:
+                val = val.strip().rstrip("/")
+                if val:
+                    urls.append(val)
+        return urls
 
 
 @lru_cache()

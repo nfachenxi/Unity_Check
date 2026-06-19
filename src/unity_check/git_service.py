@@ -91,13 +91,14 @@ def _rank_mirror_candidates(clone_url: str) -> list[str]:
     (no probing).
     """
     cfg = get_settings()
-    if not cfg.github_mirror_urls:
+    mirror_bases = cfg.get_mirror_urls()
+    if not mirror_bases:
         return [clone_url]
 
     # Probe every mirror in parallel-ish (sequential is fine for a small set)
     responsive: list[tuple[float, str]] = []
     unresponsive: list[str] = []
-    for mirror_base in cfg.github_mirror_urls:
+    for mirror_base in mirror_bases:
         mirrored_url = mirror_base.rstrip("/") + "/" + clone_url
         latency = _probe_mirror_speed(mirror_base, clone_url)
         if latency is not None:
