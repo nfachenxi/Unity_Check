@@ -128,6 +128,11 @@ def run_evaluation_pipeline(
 
         total_files_evaluated += 1
 
+        # Commit the session after each file to release the SQLite lock,
+        # allowing the progress callback (which uses its own session) to
+        # write progress_value updates without hitting "database is locked".
+        db.commit()
+
         # Notify progress after each file (both dimensions completed)
         if progress_callback:
             try:

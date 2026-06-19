@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import RiskTag from '../common/RiskTag.vue'
 
 const props = defineProps({
@@ -34,6 +34,16 @@ function toggleCollapse(filePath) {
 function isCollapsed(filePath) {
   return collapsedFiles.value.has(filePath)
 }
+
+// Reload collapsed state when eventId changes (e.g. navigating between events)
+watch(storageKey, (newKey) => {
+  try {
+    const raw = localStorage.getItem(newKey)
+    collapsedFiles.value = raw ? new Set(JSON.parse(raw)) : new Set()
+  } catch {
+    collapsedFiles.value = new Set()
+  }
+})
 
 // ---- Sorting: by highest severity desc, then score asc ----
 const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 }

@@ -93,7 +93,8 @@ def _make_progress_callback(task_pk: int) -> collections.abc.Callable[[int, int]
                 progress=f"正在评估 {current}/{total} 个文件",
                 value=pct,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("Progress callback failed for task %d (pct=%d): %s", task_pk, pct, exc)
             db2.rollback()
         finally:
             db2.close()
