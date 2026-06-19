@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     task_worker_interval: int = Field(default=2, alias="TASK_WORKER_INTERVAL")
     task_processing_timeout: int = Field(default=1800, alias="TASK_PROCESSING_TIMEOUT")
 
+    max_concurrent_workers: int = Field(default=10, alias="MAX_CONCURRENT_WORKERS")
+
     frontend_dist_dir: str = Field(default="./frontend/dist", alias="FRONTEND_DIST_DIR")
 
     frontend_password: str | None = Field(default=None, alias="FRONTEND_PASSWORD")

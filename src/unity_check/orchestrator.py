@@ -9,12 +9,16 @@ For each .cs file in the diff:
 from __future__ import annotations
 
 import collections.abc
+import concurrent.futures
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from unity_check.config import get_settings
+from unity_check.db import SessionLocal
 from unity_check.llm import evaluate_file_dimension
 from unity_check.models import EvaluationRound, GithubEvent
 from unity_check.rule_service import extract_cs_files_from_diff
@@ -22,6 +26,91 @@ from unity_check.rule_service import extract_cs_files_from_diff
 logger = logging.getLogger(__name__)
 
 DIMENSIONS = ["functionality_best_practices", "security_performance_health"]
+
+# ---------------------------------------------------------------------------
+# Thread worker — evaluates one file (both dimensions)
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_single_file(
+    file_idx: int,
+    file_path: str,
+    file_diff: str,
+    event_summary: str,
+    event_id: int,
+) -> dict[str, Any]:
+    """Evaluate both dimensions for a single file.
+
+    Intended to run inside a ``ThreadPoolExecutor`` worker thread.
+    Creates an independent DB session, persists results, and returns
+    structured data for the caller to aggregate.
+
+    Returns
+    -------
+    dict
+        ``file_path``, ``file_idx``, ``dim_a``, ``dim_b``
+        On failure ``error`` is also set.
+    """
+    session: Session | None = None
+    dim_a_result: dict[str, Any] = {}
+    dim_b_result: dict[str, Any] = {}
+    error: str | None = None
+    file_error_message: str | None = None
+
+    try:
+        session = SessionLocal()
+
+        # Dimension A — functionality_best_practices
+        dim_a_start = datetime.now(timezone.utc)
+        dim_a_result = evaluate_file_dimension(
+            file_path=file_path,
+            file_diff=file_diff,
+            event_summary=event_summary,
+            dimension="functionality_best_practices",
+        )
+        dim_a_dur = int((datetime.now(timezone.utc) - dim_a_start).total_seconds() * 1000)
+        _persist_dimension_result(
+            session, event_id, file_idx, file_path,
+            "functionality_best_practices", dim_a_result, dim_a_dur,
+        )
+
+        # Dimension B — security_performance_health
+        dim_b_start = datetime.now(timezone.utc)
+        dim_b_result = evaluate_file_dimension(
+            file_path=file_path,
+            file_diff=file_diff,
+            event_summary=event_summary,
+            dimension="security_performance_health",
+        )
+        dim_b_dur = int((datetime.now(timezone.utc) - dim_b_start).total_seconds() * 1000)
+        _persist_dimension_result(
+            session, event_id, file_idx, file_path,
+            "security_performance_health", dim_b_result, dim_b_dur,
+        )
+
+        session.commit()
+
+    except Exception as exc:
+        logger.exception("Worker evaluation failed for %s event_id=%s", file_path, event_id)
+        error = "worker_exception"
+        file_error_message = str(exc)
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+    finally:
+        if session is not None:
+            session.close()
+
+    return {
+        "file_path": file_path,
+        "file_idx": file_idx,
+        "dim_a": dim_a_result,
+        "dim_b": dim_b_result,
+        "error": error,
+        "error_message": file_error_message,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -65,88 +154,89 @@ def run_evaluation_pipeline(
             "recommendation": event.recommendation,
         }
 
-    # ---- Step 2: Per-file, per-dimension LLM evaluation ---------------------
-    all_dim_scores: dict[str, list[float]] = {"functionality_best_practices": [], "security_performance_health": []}
-    all_dim_summaries: dict[str, list[str]] = {"functionality_best_practices": [], "security_performance_health": []}
-    all_findings: list[dict[str, Any]] = []
-    total_files_evaluated = 0
-    rounds_completed = 0
+    # ---- Step 2: Parallel file-level evaluation ----------------------------
+    total_files = len(cs_files)
+    completed_count = 0
+    completed_lock = threading.Lock()
+    all_results: list[dict[str, Any]] = []
+    all_results_lock = threading.Lock()
+    max_workers = get_settings().max_concurrent_workers
 
-    for file_idx, file_path in enumerate(cs_files, start=1):
-        file_diff = _extract_file_diff(diff, file_path)
+    # Pre-extract file diffs (fast, single-threaded)
+    file_defs: list[tuple[int, str, str]] = [
+        (idx, fp, _extract_file_diff(diff, fp))
+        for idx, fp in enumerate(cs_files, start=1)
+    ]
 
-        for dim in DIMENSIONS:
-            start = datetime.now(timezone.utc)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {
+            executor.submit(
+                _evaluate_single_file, idx, fp, fdiff, event_summary, event_id,
+            ): (idx, fp)
+            for idx, fp, fdiff in file_defs
+        }
+
+        for future in concurrent.futures.as_completed(future_to_file):
+            idx, fp = future_to_file[future]
             try:
-                result = evaluate_file_dimension(
-                    file_path=file_path,
-                    file_diff=file_diff,
-                    event_summary=event_summary,
-                    dimension=dim,
-                )
-                dur = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
-
-                if result.get("error"):
-                    _persist_evaluation_round(
-                        db, event_id=event_id, round_number=file_idx,
-                        round_type=dim, file_path=file_path, status="failed",
-                        input_summary={"file_path": file_path, "dimension": dim},
-                        output_data=None, model_name=result.get("model_name", ""),
-                        tokens_used=result.get("tokens_used", 0), duration_ms=dur,
-                        error_message=result["error"],
-                    )
-                    all_dim_scores[dim].append(0.0)
-                else:
-                    score = result.get("score", 0)
-                    summary = result.get("summary", "")
-                    findings = result.get("findings", [])
-
-                    _persist_evaluation_round(
-                        db, event_id=event_id, round_number=file_idx,
-                        round_type=dim, file_path=file_path, status="success",
-                        input_summary={"file_path": file_path, "dimension": dim},
-                        output_data={"score": score, "summary": summary, "findings": findings},
-                        score=score,
-                        model_name=result.get("model_name", ""),
-                        tokens_used=result.get("tokens_used", 0), duration_ms=dur,
-                    )
-                    all_dim_scores[dim].append(score)
-                    all_dim_summaries[dim].append(summary)
-                    all_findings.extend(findings)
-                    rounds_completed += 1
-
+                result = future.result()
+                with all_results_lock:
+                    all_results.append(result)
             except Exception as exc:
-                dur = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
-                _persist_evaluation_round(
-                    db, event_id=event_id, round_number=file_idx,
-                    round_type=dim, file_path=file_path, status="failed",
-                    input_summary={"file_path": file_path, "dimension": dim},
-                    output_data=None, tokens_used=0, duration_ms=dur,
-                    error_message=str(exc),
-                )
-                logger.exception("Dimension %s failed for %s event_id=%s", dim, file_path, event_id)
+                logger.exception("Unexpected worker error for %s event_id=%s", fp, event_id)
+                with all_results_lock:
+                    all_results.append({
+                        "file_path": fp, "file_idx": idx,
+                        "dim_a": {}, "dim_b": {},
+                        "error": "unexpected_error",
+                        "error_message": str(exc),
+                    })
 
-        total_files_evaluated += 1
+            # Thread-safe progress tracking
+            with completed_lock:
+                completed_count += 1
+                current = completed_count
 
-        # Commit the session after each file to release the SQLite lock,
-        # allowing the progress callback (which uses its own session) to
-        # write progress_value updates without hitting "database is locked".
-        db.commit()
-
-        # Notify progress after each file (both dimensions completed)
-        if progress_callback:
-            try:
-                progress_callback(file_idx, len(cs_files))
-            except Exception:
-                logger.warning("Progress callback failed for file %d/%d", file_idx, len(cs_files))
+            if progress_callback:
+                try:
+                    progress_callback(current, total_files)
+                except Exception:
+                    logger.warning("Progress callback failed at %d/%d", current, total_files)
 
     # ---- Step 3: Programmatic aggregation -----------------------------------
+    all_dim_scores: dict[str, list[float]] = {
+        "functionality_best_practices": [],
+        "security_performance_health": [],
+    }
+    all_dim_summaries: dict[str, list[str]] = {
+        "functionality_best_practices": [],
+        "security_performance_health": [],
+    }
+    all_findings: list[dict[str, Any]] = []
+    files_evaluated = 0
+    rounds_count = 0
+
+    for r in all_results:
+        if r.get("error"):
+            continue
+        files_evaluated += 1
+        for dim_key, dim_name in [
+            ("dim_a", "functionality_best_practices"),
+            ("dim_b", "security_performance_health"),
+        ]:
+            dim_result = r.get(dim_key, {})
+            if dim_result and not dim_result.get("error"):
+                all_dim_scores[dim_name].append(dim_result.get("score", 0))
+                all_dim_summaries[dim_name].append(dim_result.get("summary", ""))
+                all_findings.extend(dim_result.get("findings", []))
+                rounds_count += 1
+
     _aggregate_and_update_event(event, all_dim_scores, all_dim_summaries, all_findings, cs_files)
 
     return {
         "status": event.status,
-        "files_evaluated": total_files_evaluated,
-        "rounds_completed": rounds_completed,
+        "files_evaluated": files_evaluated,
+        "rounds_completed": rounds_count,
         "overall_score": event.overall_score,
         "risk_level": event.final_risk_level,
         "recommendation": event.recommendation,
@@ -292,6 +382,44 @@ def _extract_file_diff(full_diff: str, file_path: str) -> str:
             result.append(line)
 
     return "\n".join(result)
+
+
+def _persist_dimension_result(
+    session: Session,
+    event_id: int,
+    file_idx: int,
+    file_path: str,
+    dimension: str,
+    result: dict[str, Any],
+    duration_ms: int,
+) -> None:
+    """Persist a single dimension evaluation result.
+
+    Used by :func:`_evaluate_single_file` to record both dimension-A
+    and dimension-B outcomes to the database through the worker's
+    own session.
+    """
+    if result.get("error"):
+        _persist_evaluation_round(
+            session, event_id=event_id, round_number=file_idx,
+            round_type=dimension, file_path=file_path, status="failed",
+            input_summary={"file_path": file_path, "dimension": dimension},
+            output_data=None, model_name=result.get("model_name", ""),
+            tokens_used=result.get("tokens_used", 0), duration_ms=duration_ms,
+            error_message=result["error"],
+        )
+    else:
+        score = result.get("score", 0)
+        summary = result.get("summary", "")
+        findings = result.get("findings", [])
+        _persist_evaluation_round(
+            session, event_id=event_id, round_number=file_idx,
+            round_type=dimension, file_path=file_path, status="success",
+            input_summary={"file_path": file_path, "dimension": dimension},
+            output_data={"score": score, "summary": summary, "findings": findings},
+            score=score, model_name=result.get("model_name", ""),
+            tokens_used=result.get("tokens_used", 0), duration_ms=duration_ms,
+        )
 
 
 def _persist_evaluation_round(
