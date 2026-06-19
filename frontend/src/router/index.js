@@ -5,13 +5,13 @@ const routes = [
     path: '/',
     name: 'Dashboard',
     component: () => import('../views/DashboardView.vue'),
-    meta: { title: '概览看板' },
+    meta: { title: '概览看板', keepAlive: true },
   },
   {
     path: '/events',
     name: 'EventList',
     component: () => import('../views/EventListView.vue'),
-    meta: { title: '事件列表' },
+    meta: { title: '事件列表', keepAlive: true },
   },
   {
     path: '/events/:id',
