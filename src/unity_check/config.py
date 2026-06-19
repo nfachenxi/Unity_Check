@@ -40,23 +40,40 @@ class Settings(BaseSettings):
     @field_validator("github_mirror_urls", mode="before")
     @classmethod
     def _parse_mirror_urls(cls, v: object) -> list[str]:
+        import json
+
+        # Step 1: normalize to a single string
+        raw = ""
         if isinstance(v, str):
-            return [s.strip() for s in v.split(",") if s.strip()]
-        if isinstance(v, list):
+            raw = v
+        elif isinstance(v, list):
             # Flatten: each element may itself be a comma-separated string
             # (e.g. when pydantic-settings parses a JSON array where one
             # element contains multiple comma-delimited URLs)
-            result: list[str] = []
-            for item in v:
-                if isinstance(item, str):
-                    for s in item.split(","):
-                        s = s.strip()
-                        if s:
-                            result.append(s)
-                else:
-                    result.append(item)
-            return result
-        return []
+            raw = ",".join(str(item) for item in v)
+        else:
+            return []
+
+        raw = raw.strip()
+        if not raw:
+            return []
+
+        # Step 2: detect JSON array format — ["url1","url2","url3"]
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(u).strip() for u in parsed if str(u).strip()]
+            except json.JSONDecodeError:
+                pass  # fall through to comma-split below
+
+        # Step 3: comma-separated format — url1,url2,url3
+        # Clean any stray quotes/brackets that may survive from malformed input
+        return [
+            s.strip().strip('"').strip("[").strip("]")
+            for s in raw.split(",")
+            if s.strip().strip('"').strip("[").strip("]")
+        ]
 
     @model_validator(mode="after")
     def _resolve_mirrors(self) -> "Settings":
