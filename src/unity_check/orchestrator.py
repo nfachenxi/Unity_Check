@@ -73,6 +73,7 @@ def _evaluate_single_file(
             session, event_id, file_idx, file_path,
             "functionality_best_practices", dim_a_result, dim_a_dur,
         )
+        session.commit()  # Release lock immediately; don't hold across LLM call
 
         # Dimension B — security_performance_health
         dim_b_start = datetime.now(timezone.utc)
